@@ -162,6 +162,9 @@ final class World {
 
   // MARK: generation
 
+  /// A fresh island: every edit undone. The pools keep their mapped memory and are filled again from the start.
+  func reset() { generate() }
+
   private func generate() {
     let t0 = CACurrentMediaTime()
     genStages = []

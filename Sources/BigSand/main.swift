@@ -108,6 +108,8 @@ protocol Scene: AnyObject {
   func encodePresent(_ cb: MTLCommandBuffer, from tex: MTLTexture, pass: MTLRenderPassDescriptor)
   func key(_ code: UInt16) -> Bool   // true if it handled the key
   func title(frameMs: Double, drawMs: Double) -> String
+  /// Back to the start: the cube hangs in the sky again; the island is generated afresh.
+  func reset()
 }
 
 extension Engine: Scene {
@@ -144,7 +146,10 @@ final class View: MTKView {
   var scroll: ((CGFloat) -> Void)?
   var left = false, right = false, captured = false
   override var acceptsFirstResponder: Bool { true }
-  override func keyDown(with ev: NSEvent) { if ev.keyCode == 53 { release() } else { keys.insert(ev.keyCode) } }
+  override func keyDown(with ev: NSEvent) {
+    if ev.modifierFlags.contains(.command) { return }   // Cmd shortcuts belong to the menu, not to flying
+    if ev.keyCode == 53 { release() } else { keys.insert(ev.keyCode) }
+  }
   override func keyUp(with ev: NSEvent) { keys.remove(ev.keyCode) }
   override func flagsChanged(with ev: NSEvent) { shift = ev.modifierFlags.contains(.shift) }
   override func mouseDown(with ev: NSEvent) { if captured { left = true } else { capture() } }
@@ -172,7 +177,11 @@ final class Renderer: NSObject, MTKViewDelegate {
   var simMs: [Double] = [], drawMs: [Double] = []
   let lock = NSLock()
   weak var window: NSWindow?
+  var reloadPending = false
   init(_ e: Scene) { self.e = e; cam = e.startCam() }
+
+  /// Cmd-R: start the scene over at the next frame.
+  @objc func reload(_ sender: Any?) { reloadPending = true }
 
   func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) { scaler = nil }
 
@@ -209,6 +218,7 @@ final class Renderer: NSObject, MTKViewDelegate {
       case 2: cam.pos += r * speed; case 0: cam.pos -= r * speed
       case 14: cam.pos.y += speed; case 12: cam.pos.y -= speed
       default: break } }
+    if reloadPending { reloadPending = false; e.reset(); valid = false }
     for k in v.keys where e.key(k) { v.keys.remove(k); if k == 15 { valid = false } }   // the scene's keys (R: start MetalFX's history over too)
     if v.keys.remove(49) != nil { running.toggle() }          // Space
     if v.keys.remove(3) != nil { shadows.toggle() }           // F
@@ -286,6 +296,16 @@ view.delegate = renderer
 view.look = { dx, dy in renderer.cam.yaw -= Float(dx) * 0.003; renderer.cam.pitch = max(-1.5, min(1.5, renderer.cam.pitch - Float(dy) * 0.003)) }
 view.scroll = { dy in renderer.cam.speed = max(4, min(20000, renderer.cam.speed * Float(pow(1.02, Double(dy))))) }
 win.acceptsMouseMovedEvents = true
+// The menu: Cmd-R starts over, Cmd-Q quits.
+let mainMenu = NSMenu(), appItem = NSMenuItem(), appMenu = NSMenu()
+let reloadItem = NSMenuItem(title: "Reload", action: #selector(Renderer.reload(_:)), keyEquivalent: "r")
+reloadItem.target = renderer
+appMenu.addItem(reloadItem)
+appMenu.addItem(.separator())
+appMenu.addItem(NSMenuItem(title: "Quit BigSand", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+appItem.submenu = appMenu
+mainMenu.addItem(appItem)
+app.mainMenu = mainMenu
 win.contentView = view
 win.collectionBehavior = [.fullScreenPrimary]      // full screen (Ctrl-Cmd-F): where macOS Game Mode turns on
 win.center(); win.makeKeyAndOrderFront(nil); win.makeFirstResponder(view)
