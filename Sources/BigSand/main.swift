@@ -6,7 +6,8 @@ import MetalFX
 
 // BigSand: a cube of sand falls and piles up.
 //   swift run -c release BigSand                 window: WASD/QE fly, drag to look, Shift fast, R drop again, Space pause, F shadows
-//   swift run -c release BigSand --shots [N]     headless: N ticks, a few saved frames, grain census
+//   swift run -c release BigSand --shots [N]     headless: N ticks, a few saved frames, GPU ms per pass, grain census
+//   --cube S (either mode): a cube S cells on a side (multiple of 64; default 1024, 1.07 G grains; 4096 is 68.7 G)
 
 
 // MARK: - headless benchmark
@@ -32,9 +33,12 @@ func savePNG(_ tex: MTLTexture, _ engine: Engine, _ path: String) {
 
 func median(_ a: [Double]) -> Double { a.isEmpty ? 0 : a.sorted()[a.count / 2] }
 
-/// Headless look: run `ticks` ticks, save a few frames, check that no grain was created or lost.
-func shots(ticks: Int, outDir: String) throws {
-  let e = try Engine()
+/// Headless run: `ticks` ticks, a few saved frames, GPU time per pass, and a check that no grain was created or lost.
+/// Each pass runs in its own command buffer so the GPU's start and end times of that buffer time it.
+func shots(ticks: Int, outDir: String, cube: Int) throws {
+  let e = try Engine(cube: cube)
+  print(String(format: "cube %d (%.2f G grains) in a %d x %d x %d world, %.2f GB of world state, %d flow steps per tick",
+               cube, Double(e.grains) / 1e9, e.WX, e.HY, e.WZ, Double(e.bytes) / 1e9, e.substeps))
   let before = e.census()
   let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1512, height: 982, mipmapped: false)
   td.usage = [.shaderWrite, .shaderRead]; td.storageMode = .private
@@ -43,15 +47,45 @@ func shots(ticks: Int, outDir: String) throws {
   let depth = e.device.makeTexture(descriptor: td)!
   td.pixelFormat = .rg16Float
   let motion = e.device.makeTexture(descriptor: td)!
-  var cam = FlyCam().uniforms(aspect: 1512.0 / 982.0, shadows: true)
+  var cam = FlyCam(world: e).uniforms(aspect: 1512.0 / 982.0, shadows: true)
   let at: Set<Int> = [60, 90, 110, 140, 200, 300, ticks - 1]
+  let passes = ["plan", "fall", "flow", "surface", "sun", "bounds"]
+  var ms: [String: [Double]] = [:], draw: [Double] = [], tickMs: [Double] = []
+  print("tick    plan   fall   flow  surf.    sun bounds    | whole tick  (GPU ms)  tiles awake")
   for i in 0..<ticks {
-    let cb = e.queue.makeCommandBuffer()!
-    e.encodeTick(cb)
-    if at.contains(i) { var same = cam; e.encodeRender(cb, to: tex, depth: depth, motion: motion, cam: &cam, prev: &same) }
-    cb.commit(); cb.waitUntilCompleted()
-    if at.contains(i) { savePNG(tex, e, "\(outDir)/tick-\(i).png") }
+    // Even ticks: each pass in its own command buffer, to time the passes. Odd ticks: the whole tick in one command
+    // buffer, as the window runs it, to time the tick (separate buffers add gaps and let the GPU's clock drop between them).
+    var cbs: [(String, MTLCommandBuffer)] = []
+    if i % 2 == 0 {
+      e.encodeTick { name in
+        if let c = cbs.last, c.0 == name { return c.1 }
+        let c = e.queue.makeCommandBuffer()!; cbs.append((name, c)); return c
+      }
+    } else {
+      let c = e.queue.makeCommandBuffer()!; e.encodeTick(c); cbs.append(("tick", c))
+    }
+    for (_, c) in cbs { c.commit() }
+    for (_, c) in cbs { c.waitUntilCompleted() }
+    var row: [Double] = []
+    for (name, c) in cbs { let t = (c.gpuEndTime - c.gpuStartTime) * 1e3; ms[name, default: []].append(t); row.append(t) }
+    let total = cbs.map { $0.1.gpuEndTime }.max()! - cbs.map { $0.1.gpuStartTime }.min()!
+    if i % 2 == 1 { tickMs.append(total * 1e3) }
+    if at.contains(i) {
+      let cr = e.queue.makeCommandBuffer()!
+      var same = cam; e.encodeRender(cr, to: tex, depth: depth, motion: motion, cam: &cam, prev: &same)
+      cr.commit(); cr.waitUntilCompleted()
+      draw.append((cr.gpuEndTime - cr.gpuStartTime) * 1e3)
+      savePNG(tex, e, "\(outDir)/tick-\(i).png")
+    }
+    if i % 2 == 0 && (at.contains(i) || i % 50 == 0) {
+      print(String(format: "%4d ", i) + row.map { String(format: " %6.2f", $0) }.joined() + String(format: "    |            %8d", e.activeTiles))
+    } else if i % 2 == 1 && (at.contains(i) || i % 50 == 1) {
+      print(String(format: "%4d  (one command buffer)                         | %6.2f      %8d", i, total * 1e3, e.activeTiles))
+    }
   }
+  for p in passes { let a = ms[p] ?? []; print(String(format: "%-8@ median %6.2f ms, max %6.2f ms", p as NSString, median(a), a.max() ?? 0)) }
+  print(String(format: "tick     median %6.2f ms, max %6.2f ms (whole ticks, one command buffer each)", median(tickMs), tickMs.max() ?? 0))
+  print(String(format: "draw     median %6.2f ms at 1512x982", median(draw)))
   let after = e.census()
   print("grains: \(before) before, \(after) after -> \(before == after ? "conserved" : "CHANGED BY \(after - before)")")
 }
@@ -85,7 +119,7 @@ final class Renderer: NSObject, MTKViewDelegate {
   var simMs: [Double] = [], drawMs: [Double] = [], act: [Int] = []
   let lock = NSLock()
   weak var window: NSWindow?
-  init(_ e: Engine) { self.e = e }
+  init(_ e: Engine) { self.e = e; cam = FlyCam(world: e) }
 
   func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) { scaler = nil }
 
@@ -138,7 +172,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
     let now = CACurrentMediaTime(), dt = Float(min(now - last, 0.1)); last = now
     // fly
-    let speed: Float = (v.shift ? 2400 : 600) * dt
+    let speed: Float = cam.speed * (v.shift ? 4 : 1) * dt
     let f = cam.forward, r = simd_normalize(simd_cross(f, SIMD3<Float>(0, 1, 0)))
     for k in v.keys { switch k {
       case 13: cam.pos += f * speed; case 1: cam.pos -= f * speed
@@ -213,17 +247,18 @@ final class Renderer: NSObject, MTKViewDelegate {
 }
 
 let args = CommandLine.arguments
+let cubeArg = args.firstIndex(of: "--cube").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 1024
 if let i = args.firstIndex(of: "--shots") {
   let n = i + 1 < args.count ? Int(args[i + 1]) ?? 400 : 400
   let out = FileManager.default.currentDirectoryPath + "/shots"
   try? FileManager.default.createDirectory(atPath: out, withIntermediateDirectories: true)
-  try shots(ticks: n, outDir: out)
+  try shots(ticks: n, outDir: out, cube: cubeArg)
   exit(0)
 }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
-let engine = try Engine()
+let engine = try Engine(cube: cubeArg)
 let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1512, height: 982), styleMask: [.titled, .closable, .resizable, .miniaturizable],
                    backing: .buffered, defer: false)
 let view = View(frame: win.contentView!.bounds, device: engine.device)

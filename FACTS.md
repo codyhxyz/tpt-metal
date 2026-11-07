@@ -30,6 +30,6 @@ Re-measure with `xcrun swiftc -O bench/roofline.swift -o .build/roofline && .bui
 - 16.7 ms frame (60 fps) × 120 GB/s = **2.0 GB of memory traffic per frame, total**, for physics and drawing together. Our steady-60 rule (≤12 ms GPU) makes that **1.4 GB**.
 
 ## Toolchain
-- Swift 6.4.2 (`xcrun swiftc`). Metal shaders compile at run time from source for now. The offline Metal compiler isn't installed yet (`xcodebuild -downloadComponent MetalToolchain`): needed for precompiled shaders, so the app starts instantly.
+- Swift 6.4.2 (`xcrun swiftc`). Shaders are precompiled by `scripts/build-shaders.sh` (Metal Toolchain installed); the app compiles `Shaders/BigSand.metal` at launch only when no `.metallib` is found.
 
 Sources: [Apple newsroom, M5](https://www.apple.com/jo/newsroom/2025/10/apple-unleashes-m5-the-next-big-leap-in-ai-performance-for-apple-silicon/), [Wikipedia, Apple M5](https://en.wikipedia.org/wiki/Apple_M5) (153.6 GB/s, LPDDR5X-9600).

@@ -2,20 +2,22 @@
 //
 // Units: a cell is 1 cm; a tick is 1/60 s.
 // Sand is in one of two places:
-//   - in the air: 1 bit per cell, columns of 64-cell words. Each column has a fall speed (gravity accelerates it).
+//   - in the air: per column, one run of cells [lo, hi) that falls together with the column's speed (gravity
+//     accelerates it). 8 bytes per column, however tall the run: moving it changes two numbers, not its cells.
 //   - in the pile: a shallow granular flow (Savage-Hutter) on 8x8-column cells = the tiles. Each tile holds its exact
 //     grain count V and its momentum Q; the pile's surface (one height per column) is rebuilt from them every tick.
-// Grains move from the air to the pile when they reach it; the total (sum of V + airborne bits) never changes.
+// Grains move from the air to the pile when they reach it; the total (sum of V + run lengths) never changes.
+// A column's airborne sand is always one solid run: it starts as one, falls as a whole, and only loses grains at its
+// bottom, to the pile.
 //
-// Memory layout of the air bits: columns grouped in 8x8 tiles; inside a tile, word w of all 64 columns sits side
-// by side (addr = (tile*WORDS + w)*64 + lane), so a tile's 64 threads read each word in one 512-byte burst.
+// The world's size is set when the pipelines are built (function constants), so one compiled library serves any.
 
 #include <metal_stdlib>
 using namespace metal;
-#define WX 4096
-#define WZ 4096
-#define WORDS 32
-#define HY (WORDS * 64)
+constant int WX [[function_constant(0)]];          // columns along x and z: multiples of 64
+constant int WZ [[function_constant(1)]];
+constant int HY [[function_constant(2)]];          // cells of height, at most 65535 (a run's ends are 16 bits)
+constant int SUBSTEPS [[function_constant(3)]];    // flow steps per tick (stability; see below)
 #define TX (WX / 8)
 #define TZ (WZ / 8)
 #define SX (WX / 64)
@@ -26,18 +28,29 @@ using namespace metal;
 #define G 0.2725f           // gravity: 9.81 m/s^2 = 981 cells/s^2 = 0.2725 cells/tick^2
 #define VMAX 30.0f          // fastest fall, cells/tick (18 m/s)
 #define MU 0.6494f          // Coulomb friction of dry sand: tan 33 deg, its angle of repose
-#define SUBSTEPS 12  // flow steps per tick, for stability: (|u| + sqrt(g h)) dt/dx <= 0.5 with |u| <= UMAX, h <= 1100
+// SUBSTEPS: for stability (|u| + sqrt(g h)) dt/dx <= 0.5 with |u| <= UMAX; the engine picks it from the deepest
+// pile the cube can make.
 #define DT (1.0f / float(SUBSTEPS))
 #define DX 8.0f             // a flow cell is one 8x8-column tile
 #define UMAX 25.0f          // flow speed cap, cells/tick (15 m/s)
 
-inline uint addr(int x, int z, int w) {
-  uint tile = uint(z >> 3) * TX + uint(x >> 3);
-  return ((tile * WORDS + uint(w)) << 6) | uint(((z & 7) << 3) | (x & 7));
-}
-inline uint colIdx(int x, int z) { return uint(z) * WX + uint(x); }
+// --- the sun (see sunShadow)
+#define SUN_DIR float3(-0.55f, 0.70f, -0.35f)   // toward the sun (the camera's default view faces away from it)
+#define SUN_M (SUN_DIR.z / abs(SUN_DIR.x))      // z tiles per x tile along a sun line (|SUN_DIR.x| >= |SUN_DIR.z|)
+#define SUN_RISE (SUN_DIR.y / abs(SUN_DIR.x) * DX)   // sun-ray height gained per x tile, in cells
+#define U0 int(floor(min(SUN_M, 0.0f) * float(TX - 1)))
+#define NL (TZ - U0 + int(ceil(max(SUN_M, 0.0f) * float(TX - 1))) + 1)   // lines
+
+inline uint colIdx(int x, int z) { return uint(z) * uint(WX) + uint(x); }
+
+// A column's airborne run, 8 bytes: x = lo | hi << 16 (cells [lo, hi); empty if hi <= lo);
+// y = speed in 1/2048 cell per tick | how far into the next cell it has travelled, in 1/65536 cell, << 16.
+#define VQ 2048.0f
+#define GQ uint(G * VQ + 0.5f)
+#define VMAXQ uint(VMAX * VQ)
+inline int runLo(uint2 r) { return int(r.x & 0xffffu); }
+inline int runHi(uint2 r) { return int(r.x >> 16); }
 inline uint pcg(uint v) { uint s = v * 747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
-inline ulong maskBelow(int n) { return n <= 0 ? 0ul : (n >= 64 ? ~0ul : ((1ul << ulong(n)) - 1ul)); }
 
 struct Tick { uint tick; uint sub; uint pad0; uint pad1; };
 
@@ -46,7 +59,7 @@ kernel void plan(device const uint* changedLast [[buffer(0)]], device uint* chan
                  device uint* countdown [[buffer(2)]], device uint* awake [[buffer(3)]],
                  device atomic_uint* args [[buffer(4)]], device uint* active [[buffer(5)]],
                  uint t [[thread_position_in_grid]]) {
-  if (t >= TX * TZ) return;
+  if (t >= uint(TX * TZ)) return;
   int tx = int(t % TX), tz = int(t / TX);
   bool any = false;
   for (int dz = -1; dz <= 1; dz++) for (int dx = -1; dx <= 1; dx++) {
@@ -58,18 +71,16 @@ kernel void plan(device const uint* changedLast [[buffer(0)]], device uint* chan
   if (c > 0) active[atomic_fetch_add_explicit(args, 1, memory_order_relaxed)] = t;
 }
 // One thread per active tile for the flow: threadgroups of 64.
-// And the sun-height pass: all tiles, but only on ticks where any tile ran (a world at rest keeps last tick's map).
+// And the sun-height pass: all sun lines, but only on ticks where any tile ran (a world at rest keeps last tick's map).
 kernel void flowArgs(device const uint* args [[buffer(0)]], device uint* args2 [[buffer(1)]], device uint* args3 [[buffer(2)]]) {
   args2[0] = (args[0] + 63u) / 64u; args2[1] = 1u; args2[2] = 1u;
-  args3[0] = args[0] > 0u ? (TX * TZ + 63u) / 64u : 0u; args3[1] = 1u; args3[2] = 1u;
+  args3[0] = args[0] > 0u ? uint(NL + 63) / 64u : 0u; args3[1] = 1u; args3[2] = 1u;
 }
 
-// --- air: every airborne grain in a column falls with the column's speed. One shift moves the whole column;
-// grains that reach the pile's surface (or the floor) this tick join the pile's grain count.
-// Each thread streams its column up through two registers (this word, the next): every word is read once and
-// written only if it changed, and no on-chip memory is reserved, so a core keeps many groups in flight to hide
-// memory latency.
-kernel void fall(device ulong* vox [[buffer(0)]], device const uint* HF [[buffer(1)]], device float2* FV [[buffer(2)]],
+// --- air: every column's run falls with the column's speed: two numbers change, however tall the run.
+// Grains that reach the pile's surface (or the floor) this tick leave the run's bottom and join the pile's count.
+// Columns whose run is above the highest the pile has been don't need the pile's height at all.
+kernel void fall(device uint2* runs [[buffer(0)]], device const uint* HF [[buffer(1)]], device const uint* pileTop [[buffer(2)]],
                  device atomic_int* V [[buffer(3)]], device const uint* active [[buffer(4)]], device uint* changed [[buffer(5)]],
                  device uint2* air [[buffer(6)]],
                  uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
@@ -84,36 +95,23 @@ kernel void fall(device ulong* vox [[buffer(0)]], device const uint* HF [[buffer
     atomic_store_explicit(&tgAny, 0u, memory_order_relaxed); atomic_store_explicit(&tgLanded, 0, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // airborne sand of this tile lies in [ae.x, ae.y); the word below it receives what falls out of the lowest one
-  int w0 = max(0, int(ae.x >> 6) - 1), w1 = min(WORDS - 1, int((ae.y - 1u) >> 6));
   uint ci = colIdx(x, z);
-  float2 fv = FV[ci];
-  float v = min(fv.x + G, VMAX), s = fv.y + v;
-  int d = int(floor(s));
-  int cut = int(HF[ci]) + d;                 // everything below this reaches the pile (or the floor) this tick
-  int landed = 0, lo = -1, hi = 0;
-  ulong raw = vox[addr(x, z, w0)];
-  ulong m = maskBelow(cut - w0 * 64);
-  landed += int(popcount(raw & m));
-  ulong cur = raw & ~m;
-  for (int w = w0; w <= w1; w++) {
-    ulong nraw = 0ul, nxt = 0ul;
-    if (w < w1) {
-      nraw = vox[addr(x, z, w + 1)];
-      ulong mn = maskBelow(cut - (w + 1) * 64);
-      landed += int(popcount(nraw & mn));
-      nxt = nraw & ~mn;
-    }
-    ulong o = d > 0 ? (cur >> ulong(d)) | (nxt << ulong(64 - d)) : cur;
-    if (o != raw) vox[addr(x, z, w)] = o;
-    if (o != 0ul) { if (lo < 0) lo = w * 64 + int(ctz(o)); hi = w * 64 + 64 - int(clz(o)); }
-    raw = nraw; cur = nxt;
+  uint2 r = runs[ci];
+  int lo = runLo(r), hi = runHi(r), landed = 0, nlo = 0, nhi = 0;
+  if (hi > lo) {
+    uint v = min((r.y & 0xffffu) + GQ, VMAXQ);
+    uint s = (r.y >> 16) + v * uint(65536.0f / VQ);
+    int d = int(s >> 16);                    // whole cells fallen this tick
+    int cut = lo >= int(*pileTop) + d ? lo : int(HF[ci]) + d;   // everything below this reaches the pile (or the floor)
+    int keep = clamp(cut, lo, hi);
+    landed = keep - lo;
+    nlo = keep - d; nhi = hi - d;
+    uint2 o = nhi > nlo ? uint2(uint(nlo) | (uint(nhi) << 16), v | ((s & 0xffffu) << 16)) : uint2(0u);
+    runs[ci] = o;
   }
-  if (lo >= 0) FV[ci] = float2(v, s - float(d));
-  else if (fv.x != 0.0f || fv.y != 0.0f) FV[ci] = float2(0.0f);
   if (landed > 0) atomic_fetch_add_explicit(&tgLanded, landed, memory_order_relaxed);
-  if (lo >= 0) { atomic_fetch_min_explicit(&tgLo, uint(lo), memory_order_relaxed); atomic_fetch_max_explicit(&tgHi, uint(hi), memory_order_relaxed); }
-  if (lo >= 0 || landed > 0) atomic_store_explicit(&tgAny, 1u, memory_order_relaxed);
+  if (nhi > nlo) { atomic_fetch_min_explicit(&tgLo, uint(nlo), memory_order_relaxed); atomic_fetch_max_explicit(&tgHi, uint(nhi), memory_order_relaxed); }
+  if (nhi > nlo || landed > 0) atomic_store_explicit(&tgAny, 1u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lane == 0) {
     int L = atomic_load_explicit(&tgLanded, memory_order_relaxed);
@@ -232,7 +230,7 @@ kernel void surface(device const int* V [[buffer(0)]], device uint* HF [[buffer(
 // the sand in the air only (sa), which is all a shadow ray has to look for.
 kernel void superBounds(device const uint2* tb [[buffer(0)]], device uint2* sb [[buffer(1)]],
                         device const uint2* air [[buffer(2)]], device uint2* sa [[buffer(3)]], uint s [[thread_position_in_grid]]) {
-  if (s >= SX * SZ) return;
+  if (s >= uint(SX * SZ)) return;
   int sx = int(s % SX), sz = int(s / SX); uint lo = 0xffffffffu, hi = 0u, alo = 0xffffffffu, ahi = 0u;
   for (int z = 0; z < 8; z++) for (int x = 0; x < 8; x++) {
     uint t = (sz * 8 + z) * TX + sx * 8 + x;
@@ -244,60 +242,55 @@ kernel void superBounds(device const uint2* tb [[buffer(0)]], device uint2* sb [
   sa[s] = alo < ahi ? uint2(alo, ahi) : uint2(0u);
 }
 
-// --- the sun's height over the pile: per tile, the height below which the pile itself blocks the sun. Marches from
-// the tile toward the sun over the tiles' mean heights (bilinear), one tile per step, until the sun's rise passes the
-// pile's highest point. A pixel's pile shadow is then one lookup instead of a ray. Rebuilt only on ticks where
-// something moved; a world at rest keeps it.
-#define SUN_DIR float3(-0.55f, 0.70f, -0.35f)   // toward the sun (the camera's default view faces away from it)
-inline float tileMean(device const int* V, float2 q) {   // q in tile units; tile centres at i + 0.5
-  float2 c = clamp(q - 0.5f, float2(0.0f), float2(TX - 1, TZ - 1));
-  int2 i = min(int2(c), int2(TX - 2, TZ - 2)); float2 f = c - float2(i);
-  uint t = uint(i.y) * TX + uint(i.x);
-  return mix(mix(float(V[t]), float(V[t + 1]), f.x), mix(float(V[t + TX]), float(V[t + TX + 1]), f.x), f.y) / 64.0f;
+// --- the sun's height over the pile: the height below which the pile itself blocks the sun, so a pixel's pile shadow
+// is one lookup instead of a ray. Rebuilt only on ticks where something moved; a world at rest keeps it.
+// One sweep per line of tiles toward the sun: a line steps one tile in x (the sun's major axis) and SUN_M tiles in z,
+// and carries the running answer S(i) = max(h(i-1), S(i-1)) - rise, where h is the pile's mean height at the line's
+// previous point. One sample per tile per line, instead of a march of up to (pile height / rise) steps per tile.
+// Lines are indexed by u = z + SUN_M * x (constant along a line); the map stores S at (column x, line u - U0).
+inline float tileMeanZ(device const int* V, int x, float zc) {   // mean height at tile column x, tile row zc (centres at integers)
+  if (zc <= -1.0f || zc >= float(TZ)) return 0.0f;
+  int z0 = int(floor(zc)); float f = zc - float(z0);
+  float a = z0 >= 0 ? float(V[uint(z0) * uint(TX) + uint(x)]) : 0.0f;
+  float b = z0 + 1 < TZ ? float(V[uint(z0 + 1) * uint(TX) + uint(x)]) : 0.0f;
+  return mix(a, b, f) / 64.0f;
 }
-kernel void sunShadow(device const int* V [[buffer(0)]], device float* S [[buffer(1)]], device atomic_uint* pileTop [[buffer(2)]],
-                      uint t [[thread_position_in_grid]]) {
-  if (t >= TX * TZ) return;
-  float3 L = normalize(SUN_DIR);
-  float2 dir = normalize(L.xz);
-  float rise = L.y / length(L.xz) * DX;               // sun-ray height gained per tile stepped
-  float top = float(atomic_load_explicit(pileTop, memory_order_relaxed));
-  float2 p = float2(float(t % TX), float(t / TX)) + 0.5f;
-  float best = 0.0f;
-  for (int k = 1; float(k) * rise <= top; k++) {
-    float2 q = p + dir * float(k);
-    if (any(q < float2(0.0f)) || any(q >= float2(TX, TZ))) break;
-    best = max(best, tileMean(V, q) - float(k) * rise);
+kernel void sunShadow(device const int* V [[buffer(0)]], device float* S [[buffer(1)]], uint j [[thread_position_in_grid]]) {
+  if (int(j) >= NL) return;
+  float u = float(int(j) + U0);
+  int x0 = SUN_DIR.x < 0.0f ? 0 : TX - 1, step = SUN_DIR.x < 0.0f ? 1 : -1;   // start at the sun's side
+  float carry = 0.0f;                         // max(h, S) at the line's previous point
+  for (int k = 0; k < TX; k++) {
+    int x = x0 + k * step;
+    float sv = max(carry - SUN_RISE, 0.0f);
+    S[uint(x) * uint(NL) + j] = sv;
+    carry = max(tileMeanZ(V, x, u - SUN_M * float(x)), sv);
   }
-  S[t] = best;
 }
-inline float sunHeight(device const float* S, float x, float z) {   // bilinear, in cells
-  float2 c = clamp(float2(x, z) / DX - 0.5f, float2(0.0f), float2(TX - 1, TZ - 1));
-  int2 i = min(int2(c), int2(TX - 2, TZ - 2)); float2 f = c - float2(i);
-  uint t = uint(i.y) * TX + uint(i.x);
-  return mix(mix(S[t], S[t + 1], f.x), mix(S[t + TX], S[t + TX + 1], f.x), f.y);
+inline float sunHeight(device const float* S, float x, float z) {   // bilinear in (column, line), in cells
+  float cx = clamp(x / DX - 0.5f, 0.0f, float(TX - 1)), cz = z / DX - 0.5f;
+  float cu = clamp(cz + SUN_M * cx - float(U0), 0.0f, float(NL - 1));
+  int2 i = min(int2(int(cx), int(cu)), int2(TX - 2, NL - 2)); float2 f = float2(cx, cu) - float2(i);
+  uint t = uint(i.x) * uint(NL) + uint(i.y);
+  return mix(mix(S[t], S[t + 1], f.y), mix(S[t + uint(NL)], S[t + uint(NL) + 1], f.y), f.x);
 }
 
 struct Seed { int x0; int z0; int size; int y0; int y1; };
-kernel void seed(device ulong* a [[buffer(0)]], device uint* changed [[buffer(1)]], device uint2* air [[buffer(2)]],
+kernel void seed(device uint2* runs [[buffer(0)]], device uint* changed [[buffer(1)]], device uint2* air [[buffer(2)]],
                  device uint2* tb [[buffer(3)]], constant Seed& S [[buffer(4)]], uint2 g [[thread_position_in_grid]]) {
   if (int(g.x) >= S.size || int(g.y) >= S.size) return;
   int x = S.x0 + int(g.x), z = S.z0 + int(g.y);
-  for (int w = S.y0 >> 6; w <= (S.y1 - 1) >> 6; w++) {
-    int lo = max(S.y0, w * 64) - w * 64, hi = min(S.y1, w * 64 + 64) - w * 64;
-    ulong m = (hi - lo == 64) ? ~0ul : (((1ul << ulong(hi - lo)) - 1ul) << ulong(lo));
-    a[addr(x, z, w)] |= m;
-  }
+  runs[colIdx(x, z)] = uint2(uint(S.y0) | (uint(S.y1) << 16), 0u);   // at rest
   uint tile = uint(z >> 3) * TX + uint(x >> 3);
   changed[tile] = 1u; air[tile] = uint2(uint(S.y0), uint(S.y1)); tb[tile] = uint2(uint(S.y0), uint(S.y1));
 }
 
-// Grain census: airborne bits + every tile's pile count. Sand is conserved, so this never changes.
-kernel void census(device const ulong* a [[buffer(0)]], device const int* V [[buffer(1)]], device atomic_uint* out [[buffer(2)]],
+// Grain census: airborne run lengths + every tile's pile count. Sand is conserved, so this never changes.
+kernel void census(device const uint2* runs [[buffer(0)]], device const int* V [[buffer(1)]], device atomic_uint* out [[buffer(2)]],
                    uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {
-  uint total = TX * TZ * WORDS * 64u, c = 0;
-  for (uint k = i; k < total; k += n) c += popcount(a[k]);
-  for (uint k = i; k < TX * TZ; k += n) c += uint(V[k]);
+  uint total = uint(WX) * uint(WZ), c = 0;
+  for (uint k = i; k < total; k += n) { uint2 r = runs[k]; c += uint(max(runHi(r) - runLo(r), 0)); }
+  for (uint k = i; k < uint(TX * TZ); k += n) c += uint(V[k]);
   atomic_fetch_add_explicit(&out[i & 1023u], c, memory_order_relaxed);
 }
 
@@ -314,14 +307,10 @@ inline bool overlap(float oy, float dy, float ta, float tb, uint2 b) {
   float ya = oy + dy * ta, yb = oy + dy * tb;
   return max(ya, yb) >= float(b.x) && min(ya, yb) < float(b.y);
 }
-inline ulong rangeMask(int w, int y0, int y1) {
-  int lo = max(y0 - w * 64, 0), hi = min(y1 - w * 64, 63);
-  return (hi - lo == 63) ? ~0ul : (((1ul << ulong(hi - lo + 1)) - 1ul) << ulong(lo));
-}
 
 // First sand cell along the ray before tMax: walks 64x64 blocks, then 8x8 tiles, then columns, skipping any whose
-// sand height range the ray misses. A column is sand below its pile height, plus its airborne bits.
-float trace(float3 o, float3 d, float tMax, device const ulong* vox, device const uint* HF, device const uint2* tb,
+// sand height range the ray misses. A column is sand below its pile height, plus its airborne run.
+float trace(float3 o, float3 d, float tMax, device const uint2* runs, device const uint* HF, device const uint2* tb,
             device const uint2* sb, bool withPile, thread float3& n, thread int3& cell, thread uint& steps) {
   float3 inv = 1.0f / d;
   float3 ta = -o * inv, tc = (float3(WX, HY, WZ) - o) * inv;
@@ -331,7 +320,7 @@ float trace(float3 o, float3 d, float tMax, device const ulong* vox, device cons
   if (tin >= tout) return -1.0f;
   int axis = tin > 0 ? ((tmin.x >= tmin.y && tmin.x >= tmin.z) ? 0 : (tmin.z >= tmin.y ? 2 : 1)) : -1;
   float t = tin;
-  for (uint i = 0; i < 4096u && t < tout; i++) {
+  for (uint i = 0; i < 16384u && t < tout; i++) {
     steps++;
     float3 p = o + d * (t + 1e-3f + t * 2e-6f);
     int cx = clamp(int(floor(p.x)), 0, WX - 1), cz = clamp(int(floor(p.z)), 0, WZ - 1);
@@ -348,14 +337,18 @@ float trace(float3 o, float3 d, float tMax, device const ulong* vox, device cons
     float ya = o.y + d.y * t, yb = o.y + d.y * t1;
     int y0 = max(int(floor(min(ya, yb))), int(b.x)), y1 = min(int(floor(max(ya, yb))), int(b.y) - 1);
     if (y0 <= y1) {
-      int pile = withPile ? int(HF[colIdx(cx, cz)]) : 0;   // cells [0, pile) are sand
+      uint ci = colIdx(cx, cz);
+      int pile = withPile ? int(HF[ci]) : 0;   // cells [0, pile) are sand
+      uint2 r = runs[ci];
+      int alo = runLo(r), ahi = runHi(r);         // and cells [alo, ahi)
+      bool inAir = alo <= y1 && ahi - 1 >= y0;
       int hy = -1;
-      if (d.y < 0) {
-        for (int w = y1 >> 6; w >= (y0 >> 6) && hy < 0; w--) { ulong m = vox[addr(cx, cz, w)] & rangeMask(w, y0, y1); if (m != 0ul) hy = w * 64 + 63 - int(clz(m)); }
+      if (d.y < 0) {                              // going down: the highest sand cell in [y0, y1]
+        if (inAir) hy = min(y1, ahi - 1);
         if (pile - 1 >= y0) hy = max(hy, min(y1, pile - 1));
-      } else {
+      } else {                                    // going up: the lowest
         if (y0 < pile) hy = y0;
-        for (int w = y0 >> 6; w <= (y1 >> 6) && hy < 0; w++) { ulong m = vox[addr(cx, cz, w)] & rangeMask(w, y0, y1); if (m != 0ul) hy = w * 64 + int(ctz(m)); }
+        else if (inAir) hy = max(y0, alo);
       }
       if (hy >= 0) {
         if (hy == int(floor(ya)) && axis >= 0 && axis != 1) {
@@ -375,11 +368,11 @@ float trace(float3 o, float3 d, float tMax, device const ulong* vox, device cons
 // 1 if the sun reaches point p, else 0: under the pile's sun height (one lookup), or behind sand in the air (a ray that
 // only visits tiles with sand in the air, so it costs nothing once everything has landed).
 #define SUN_SLACK 1.0f   // cells: the sun-height map is per tile, the surface per column
-inline float sunlit(float3 p, float3 L, device const ulong* vox, device const uint* HF, device const float* S,
+inline float sunlit(float3 p, float3 L, device const uint2* runs, device const uint* HF, device const float* S,
                     device const uint2* air, device const uint2* superAir, thread uint& steps) {
   if (p.x >= 0 && p.z >= 0 && p.x < WX && p.z < WZ && p.y + SUN_SLACK < sunHeight(S, p.x, p.z)) return 0.0f;
   float3 n2; int3 c2;
-  return trace(p, L, 1e30f, vox, HF, air, superAir, false, n2, c2, steps) >= 0 ? 0.0f : 1.0f;
+  return trace(p, L, 1e30f, runs, HF, air, superAir, false, n2, c2, steps) >= 0 ? 0.0f : 1.0f;
 }
 
 // Writes MetalFX's inputs: colour, depth (reversed: NEAR / view distance, 0 = sky), and motion: per pixel, how many
@@ -387,7 +380,7 @@ inline float sunlit(float3 p, float3 L, device const ulong* vox, device const ui
 #define NEAR 1.0f
 kernel void render(texture2d<float, access::write> out [[texture(0)]], texture2d<float, access::write> depthOut [[texture(1)]],
                    texture2d<float, access::write> motionOut [[texture(2)]],
-                   device const ulong* vox [[buffer(0)]], device const uint* HF [[buffer(1)]], device const uint2* tb [[buffer(2)]],
+                   device const uint2* runs [[buffer(0)]], device const uint* HF [[buffer(1)]], device const uint2* tb [[buffer(2)]],
                    device const uint2* sb [[buffer(3)]], constant Cam& C [[buffer(4)]], device atomic_uint* stepsOut [[buffer(5)]],
                    constant Cam& P [[buffer(6)]], device const float* S [[buffer(7)]], device const uint2* air [[buffer(8)]],
                    device const uint2* superAir [[buffer(9)]], uint2 g [[thread_position_in_grid]]) {
@@ -401,7 +394,7 @@ kernel void render(texture2d<float, access::write> out [[texture(0)]], texture2d
   float3 sunCol = float3(1.0, 0.92, 0.80) * 1.15f;
   float tFloor = d.y < 0 ? -o.y / d.y : 1e30f;
   float3 n; int3 cell; uint steps = 0;
-  float th = trace(o, d, tFloor, vox, HF, tb, sb, true, n, cell, steps);
+  float th = trace(o, d, tFloor, runs, HF, tb, sb, true, n, cell, steps);
   float3 col; float tt;
   if (th >= 0) {
     // The pile is a smooth surface stored as whole-cell heights: light it with its real slope (central differences
@@ -420,7 +413,7 @@ kernel void render(texture2d<float, access::write> out [[texture(0)]], texture2d
     float h = float(pcg(uint(cell.x) ^ pcg(uint(cell.y) ^ pcg(uint(cell.z)))) & 1023u) / 1023.0f;
     float3 base = float3(0.78, 0.62, 0.38) * (0.95f + (0.4f * h - 0.2f) / max(1.0f, footprint));
     float lam = max(dot(n, L), 0.0f), sh = 1.0f;
-    if (C.shadows != 0u && lam > 0) sh = sunlit(o + d * th + n * (onPile ? 1.5f : 0.01f), L, vox, HF, S, air, superAir, steps);
+    if (C.shadows != 0u && lam > 0) sh = sunlit(o + d * th + n * (onPile ? 1.5f : 0.01f), L, runs, HF, S, air, superAir, steps);
     col = base * (sky * mix(0.28f, 0.40f, saturate(n.y)) + sunCol * lam * sh);
     tt = th;
   } else if (tFloor < 1e29f) {
@@ -429,11 +422,11 @@ kernel void render(texture2d<float, access::write> out [[texture(0)]], texture2d
     float chk = fmod(abs(floor(fp.x / 256.0f) + floor(fp.z / 256.0f)), 2.0f);
     float3 base = inside ? mix(float3(0.36, 0.35, 0.33), float3(0.42, 0.41, 0.38), chk) : float3(0.30, 0.34, 0.27);
     float sh = 1.0f;
-    if (C.shadows != 0u) sh = sunlit(fp + float3(0, 0.01f, 0), L, vox, HF, S, air, superAir, steps);
+    if (C.shadows != 0u) sh = sunlit(fp + float3(0, 0.01f, 0), L, runs, HF, S, air, superAir, steps);
     col = base * (sky * 0.40f + sunCol * max(L.y, 0.0f) * sh);
     tt = tFloor;
   } else { col = sky; tt = 1e30f; }
-  if (tt < 1e29f) col = mix(col, sky, 1.0f - exp(-tt / 30000.0f));
+  if (tt < 1e29f) col = mix(col, sky, 1.0f - exp(-tt / (7.32f * float(WX))));   // haze: 30000 cells in a 4096 world
   if (C.stats != 0u) atomic_fetch_add_explicit(stepsOut, steps, memory_order_relaxed);
   out.write(float4(col, 1.0f), g);
   float dist = tt < 1e29f ? tt : 1e9f;

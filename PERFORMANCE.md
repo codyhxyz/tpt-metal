@@ -47,7 +47,7 @@ The design rule that follows: **work must scale with what's happening, never wit
 - Once a part of the pile stops moving, it packs back into runs and goes to sleep: **zero cost**.
 
 ## 3. Seeing it
-- 3024 × 1964 = 5.9 M pixels. Trace rays at half resolution (1.5 M) and upscale with Apple's MetalFX.
+- 3024 × 1964 = 5.9 M pixels. Trace rays at a third of the resolution (0.66 M) and upscale with Apple's MetalFX.
 - Each ray walks the column runs, skipping empty space with a coarse "is anything here" hierarchy (one bit per 4³, 16³,
   64³ block). That's ~50–100 steps per ray at ~30 integer ops each, ≈ 4.5 G ops ≈ **2 ms**, the same for a world 10×
   bigger.
@@ -70,3 +70,18 @@ stays smooth at full rate, never the other way around.
 2. The run-falling kernel costs ~16 bytes of traffic per column per tick. Test: 16.7 M falling runs, ms per tick.
 3. Rays take ≤100 steps through the hierarchy. Test: count steps per pixel on the landed pile; ms per frame.
 Each test prints **expected vs measured** next to each other. A gap means the model is wrong somewhere, and we find out where.
+
+## Measured: the full-size cube (2026-11-07)
+`swift run -c release BigSand --shots 700 --cube 4096` (headless; each pass timed in its own command buffer on even
+ticks, whole ticks in one command buffer on odd ticks). 4096-cell cube, **68.7 G grains**, in a 16384 × 6144 × 16384
+world; every grain is still there after 700 ticks.
+
+- **Airborne sand is one run per column** (8 bytes: both ends, speed, sub-cell position), not 1 bit per cell. It
+  always is one run: it starts as one, falls as a whole, and loses grains only at its bottom, to the pile.
+  World state: **3.5 GB** at 68.7 G grains (the bits took 4.4 GB at 1.07 G).
+- **Fall: 1.2–1.8 ms median** at 16.7 M falling columns (model: 16 B per column = 270 MB ≈ 2.2 ms).
+  At 1.07 G grains it went from 1.6–2.2 ms (bits) to 0.11–0.15 ms (model: 0.14 ms).
+- **Sun heights: 1.3 ms** (was 37 ms). One sweep per line of tiles toward the sun carrying the running maximum,
+  instead of every tile marching toward the sun until it clears the pile.
+- **Whole tick: 12 ms median, but 20–38 ms while the pile spreads** (ticks 250–450, about 1 M tiles awake = a quarter
+  of the world). The pile's flow (16 steps per tick) and its surface rebuild are now the limit, not the falling sand.
