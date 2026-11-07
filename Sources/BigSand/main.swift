@@ -124,7 +124,7 @@ extension Engine: Scene {
 
 extension World: Scene {
   func startCam() -> FlyCam { FlyCam(island: self) }
-  func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { tool(cb, dig: dig, place: place) }
+  func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { frame(cb, dig: dig, place: place) }
   func key(_ code: UInt16) -> Bool {
     // 1-8: sand, water, stone, rock, plant, snow, basalt, wall
     let mats: [UInt16: UInt32] = [18: World.SAND, 19: World.WATER, 20: World.STONE, 21: World.ROCK, 23: World.PLANT,
@@ -132,11 +132,13 @@ extension World: Scene {
     if let m = mats[code] { material = m; return true }
     if code == 33 { radius = max(2, radius * 4 / 5); return true }     // [
     if code == 30 { radius = min(64, radius * 5 / 4 + 1); return true } // ]
+    if code == 43 { stepRate = max(1, stepRate / 2); return true }      // ,
+    if code == 47 { stepRate = min(480, stepRate * 2); return true }    // .
     return false
   }
   func title(frameMs: Double, drawMs: Double) -> String {
-    String(format: "Island %d x %d x %d · %.2f GB · %d bricks · draw %.2f ms · tool: %@, radius %d", NW, NH, NW, Double(bytes) / 1e9,
-           bricksUsed, drawMs, World.names[Int(material)] as NSString, radius)
+    String(format: "Island %d x %d x %d · %.2f GB · draw %.2f ms · physics %.2f ms, %g steps/s, %d bricks awake · tool: %@, radius %d",
+           NW, NH, NW, Double(bytes) / 1e9, drawMs, frameMs, stepRate, awakeBricks, World.names[Int(material)] as NSString, radius)
   }
 }
 

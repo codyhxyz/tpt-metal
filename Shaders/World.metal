@@ -39,6 +39,25 @@ constant int NH [[function_constant(1)]];   // cells tall (multiple of 64)
 #define C_ARGS 8             // 8..10: indirect dispatch arguments
 #define C_STEPS 11           // render: DDA steps, when counting
 #define C_PICK 12            // 12..15: the cell under the crosshair and its face (0 = nothing)
+// physics (one step: see "Physics" below)
+#define C_L0 20              // bricks in awake list 0
+#define C_L1 21              // bricks in awake list 1
+#define C_N 22               // bricks that just woke (their storage is checked at the start of the next step)
+#define C_S 23               // those bricks and their +x/+y/+z neighbours, once each
+#define C_CH 24              // uniform chunks those need a table in
+#define C_W 25               // bricks edits changed since the last step
+#define A_N 26               // 26..46: indirect dispatch arguments, three words per dispatch
+#define A_S 29
+#define A_CH 32
+#define A_SB 35
+#define A_L 38
+#define A_W 41
+#define A_LC 44
+#define W_MAXL (1u << 20)    // awake bricks at most (512 M cells)
+#define W_MAXN (1u << 18)
+#define W_MAXS (1u << 21)
+#define W_MAXC (1u << 16)
+#define W_MAXW (1u << 16)
 
 namespace wld {
 
@@ -158,6 +177,34 @@ inline uint alloc(device atomic_int* ctr, int bump, int freeTop, int cap, device
   }
   return uint(i);
 }
+// A brick's coordinates packed in one word (x 11 bits, y 7, z 11), and its bit in the awake bitmap.
+inline uint packB(int3 b) { return uint(b.x) | (uint(b.y) << 11) | (uint(b.z) << 18); }
+inline int3 unpackB(uint v) { return int3(v & 2047u, (v >> 11) & 127u, v >> 18); }
+inline bool brickInWorld(int3 b) { return all(b >= 0) && b.x < W_BX && b.y < NH / 8 && b.z < W_BX; }
+inline uint bitOf(int3 b) { return (uint(b.z) * uint(W_BX) + uint(b.x)) * uint(NH / 8) + uint(b.y); }
+// Adds b to a list once: the first thread to set its bit appends it.
+inline void insertOnce(int3 b, device atomic_uint* bits, device atomic_int* ctr, int count, device uint* list, uint cap) {
+  uint i = bitOf(b), m = 1u << (i & 31u);
+  if (atomic_fetch_or_explicit(&bits[i >> 5], m, memory_order_relaxed) & m) return;
+  int j = atomic_fetch_add_explicit(&ctr[count], 1, memory_order_relaxed);
+  if (uint(j) < cap) list[j] = packB(b);
+}
+// Adds b to the next awake list once; if it wasn't awake this step, also to the list of newly awake bricks.
+inline void insertNext(int3 b, device atomic_uint* bitsNext, device const uint* bitsCur, device atomic_int* ctr, int count,
+                       device uint* next, device uint* fresh) {
+  uint i = bitOf(b), m = 1u << (i & 31u);
+  if (atomic_fetch_or_explicit(&bitsNext[i >> 5], m, memory_order_relaxed) & m) return;
+  int j = atomic_fetch_add_explicit(&ctr[count], 1, memory_order_relaxed);
+  if (uint(j) < W_MAXL) next[j] = packB(b);
+  if (bitsCur[i >> 5] & m) return;
+  int k = atomic_fetch_add_explicit(&ctr[C_N], 1, memory_order_relaxed);
+  if (uint(k) < W_MAXN) fresh[k] = packB(b);
+}
+inline void wakeAppend(device atomic_int* ctr, device uint* wake, int3 b) {
+  int j = atomic_fetch_add_explicit(&ctr[C_W], 1, memory_order_relaxed);
+  if (uint(j) < W_MAXW) wake[j] = packB(b);
+}
+
 inline void release(device atomic_int* ctr, int freeTop, device uint* freeList, uint idx) {
   int s = atomic_fetch_add_explicit(&ctr[freeTop], 1, memory_order_relaxed);
   freeList[s] = idx;
@@ -368,7 +415,7 @@ kernel void w_fixFree(device atomic_int* ctr [[buffer(0)]]) {
 //    get storage.
 kernel void w_editBricks(device uint* grid [[buffer(0)]], device uint* tables [[buffer(1)]], device uint* bricks [[buffer(2)]],
                          device atomic_int* ctr [[buffer(3)]], device const uint* brickFree [[buffer(4)]], constant WEdit& E [[buffer(5)]],
-                         uint3 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+                         device uint* wake [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
   threadgroup atomic_uint changed;
   threadgroup uint idxS;
   int3 bc = E.brickLo.xyz + int3(tg);
@@ -389,47 +436,12 @@ kernel void w_editBricks(device uint* grid [[buffer(0)]], device uint* tables [[
   if (packed != old) atomic_store_explicit(&changed, 1u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (atomic_load_explicit(&changed, memory_order_relaxed) == 0u) return;
+  if (t == 0u) wakeAppend(ctr, wake, bc);           // the physics looks at it next step
   if (!(be & W_UNI)) { if (packed != old) bricks[ulong(be) * 128ul + t] = packed; return; }
   if (t == 0u) { idxS = alloc(ctr, C_BBUMP, C_BFREE, C_BCAP, brickFree); if (idxS != W_NONE) tables[te] = idxS; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (idxS != W_NONE) bricks[ulong(idxS) * 128ul + t] = packed;
 }
-
-// 3. Bricks the edit left all one material become uniform; their storage goes back on the free stack.
-kernel void w_editCollapse(device uint* grid [[buffer(0)]], device uint* tables [[buffer(1)]], device const uint* bricks [[buffer(2)]],
-                           device atomic_int* ctr [[buffer(3)]], device uint* brickFree [[buffer(4)]], constant WEdit& E [[buffer(5)]],
-                           uint3 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
-  threadgroup atomic_uint mixed;
-  threadgroup uint first;
-  int3 bc = E.brickLo.xyz + int3(tg);
-  if (any(bc < 0) || bc.x >= W_BX || bc.y >= NH / 8 || bc.z >= W_BX || !boxTouches(bc * 8, 8, E)) return;
-  uint ce = grid[chunkIdx(bc >> 3)];
-  if (ce & W_UNI) return;
-  ulong te = ulong(ce) * 512ul + loc(bc & 7);
-  uint be = tables[te];
-  if (be & W_UNI) return;
-  uint packed = bricks[ulong(be) * 128ul + t];
-  if (t == 0u) { first = packed & 255u; atomic_store_explicit(&mixed, 0u, memory_order_relaxed); }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (packed != first * 0x01010101u) atomic_store_explicit(&mixed, 1u, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t == 0u && atomic_load_explicit(&mixed, memory_order_relaxed) == 0u) {
-    tables[te] = W_UNI | first;
-    release(ctr, C_BFREE, brickFree, be);
-  }
-}
-
-// 4. Chunks the edit left all one material become uniform again.
-kernel void w_editTables(device uint* grid [[buffer(0)]], device uint* tables [[buffer(1)]], device uint* owner [[buffer(2)]],
-                         device atomic_int* ctr [[buffer(3)]], device uint* tableFree [[buffer(4)]], constant WEdit& E [[buffer(5)]],
-                         uint3 g [[thread_position_in_grid]]) {
-  int3 cc = E.chunkLo.xyz + int3(g);
-  if (any(cc < 0) || cc.x >= W_CX || cc.y >= W_CY || cc.z >= W_CX || !boxTouches(cc * 64, 64, E)) return;
-  uint ci = chunkIdx(cc), ce = grid[ci];
-  if (ce & W_UNI) return;
-  tryCollapseTable(ce, ci, grid, tables, owner, ctr, tableFree);
-}
-
 
 // ---------------------------------------------------------------------------------------------------------------
 // Rays. One loop walks all three levels: at each step it looks up the box containing the current cell (a whole
@@ -707,4 +719,199 @@ inline float sunShadow(depth2d_array<float> map, constant ShadowData& S, float3 
   for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++)
     sum += map.sample_compare(cmp, uv + float2(x, y) * S.texel.x, ci, l.z);
   return sum / 9.0f;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Physics. One byte per cell, nothing else: powders fall and pile at 45 degrees, water falls and spreads over water,
+// anything heavier sinks under anything lighter. No heat, reactions, velocity or pressure.
+//
+// A step cuts space into 2x2x2 blocks (shifted by one cell on alternate steps, so cells cross block edges) and one
+// thread rearranges each block's 8 cells. Every cell belongs to exactly one block, so no two threads touch a cell,
+// and cells only swap places, so nothing is ever created or lost. It runs in place on the bricks.
+//
+// Only awake bricks run. A brick is awake if a cell next to it changed last step, or an edit changed it. A step:
+//   storage  bricks that just woke, and their +x/+y/+z neighbours (a block owned by a brick reaches at most one cell
+//            into those), get a chunk table and brick storage if they are still one material. Nothing is collapsed
+//            during play, so a brick that stays awake costs nothing here.
+//   move     one 64-thread group per awake brick, one thread per block it owns; each changed cell wakes the bricks
+//            holding it and its 26 neighbouring cells for the next step
+//   wake     every brick an edit changed, and its 26 neighbours, join the next step
+// The awake list and its bitmap come in two copies, this step's and the next, which swap each step.
+
+enum : uint { ST_STATIC = 0, ST_GAS = 1, ST_POWDER = 2, ST_LIQUID = 3 };
+//                                    air       rock       sand       water      plant      snow       stone      basalt     wall
+constant uchar MAT_STATE[NMAT] = { ST_GAS, ST_STATIC, ST_POWDER, ST_LIQUID, ST_STATIC, ST_POWDER, ST_POWDER, ST_STATIC, ST_STATIC };
+constant uchar MAT_DENS[NMAT]  = { 1,      255,       16,        10,        255,       5,         25,        255,       255 };
+
+inline bool movable(uint m) { return MAT_STATE[m] != ST_STATIC; }
+inline bool sinksInto(uint a, uint b) { return movable(a) && movable(b) && MAT_DENS[a] > MAT_DENS[b]; }   // a above b swaps
+
+// The block's cells c[x + 2z + 4y]: 0-3 the bottom layer, 4-7 the top. True if anything moved.
+inline bool stepBlock(thread uint* c, uint r) {
+  uint done = 0;   // bit k: cell k already moved this step
+  bool any = false;
+  // fall: each column, top into bottom
+  for (uint k = 0; k < 4u; k++) if (sinksInto(c[k + 4], c[k])) {
+    uint t = c[k]; c[k] = c[k + 4]; c[k + 4] = t; done |= (1u << k) | (1u << (k + 4)); any = true;
+  }
+  // slide: powders and liquids that couldn't fall go to a lower cell beside them (x, z or diagonal), random order
+  for (uint i = 0; i < 4u; i++) {
+    uint k = (i + r) & 3u, a = c[k + 4];
+    if ((done >> (k + 4)) & 1u || MAT_STATE[a] < ST_POWDER) continue;
+    uint s = (r >> (2 + 2 * i)) % 3u;
+    for (uint j = 0; j < 3u; j++) {
+      uint b = k ^ (1u + (s + j) % 3u);
+      if ((done >> b) & 1u || !sinksInto(a, c[b])) continue;
+      c[k + 4] = c[b]; c[b] = a; done |= (1u << (k + 4)) | (1u << b); any = true;
+      break;
+    }
+  }
+  // spread: water resting on water moves sideways into something lighter, in the top layer
+  for (uint i = 0; i < 4u; i++) {
+    uint k = (i + (r >> 10)) & 3u, a = c[k + 4];
+    if ((done >> (k + 4)) & 1u || MAT_STATE[a] != ST_LIQUID || MAT_STATE[c[k]] != ST_LIQUID) continue;
+    uint b = k ^ (((r >> (12 + i)) & 1u) ? 1u : 2u);
+    if ((done >> (b + 4)) & 1u || !movable(c[b + 4]) || MAT_DENS[c[b + 4]] >= MAT_DENS[a]) continue;
+    c[k + 4] = c[b + 4]; c[b + 4] = a; done |= (1u << (k + 4)) | (1u << (b + 4)); any = true;
+  }
+  return any;
+}
+
+// Indirect arguments for a list: ceil(count / per) threadgroups, the count capped at the list's capacity; then up to
+// four counters set to zero (their lists are used up; ~0 = none).
+struct ArgSpec { uint4 a; uint4 zero; };   // a: count index, per, argument index, capacity
+kernel void w_args(device int* ctr [[buffer(0)]], constant ArgSpec& A [[buffer(1)]]) {
+  uint n = min(uint(max(ctr[A.a.x], 0)), A.a.w);
+  ctr[A.a.z] = int((n + A.a.y - 1) / A.a.y); ctr[A.a.z + 1] = 1; ctr[A.a.z + 2] = 1;
+  for (int i = 0; i < 4; i++) if (A.zero[i] != ~0u) ctr[A.zero[i]] = 0;
+}
+
+// Each newly awake brick and its 7 neighbours in +x/+y/+z, once each (through the idle bitmap, which is clear)
+kernel void w_storageList(device const uint* N [[buffer(0)]], device atomic_int* ctr [[buffer(1)]], device atomic_uint* bits [[buffer(2)]],
+                          device uint* S [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid >= min(uint(atomic_load_explicit(&ctr[C_N], memory_order_relaxed)), W_MAXN)) return;
+  int3 b = unpackB(N[gid]);
+  for (int i = 0; i < 8; i++) {
+    int3 n = b + int3(i & 1, i >> 2, (i >> 1) & 1);
+    if (brickInWorld(n)) insertOnce(n, bits, ctr, C_S, S, W_MAXS);
+  }
+}
+
+kernel void w_clearBits(device const uint* list [[buffer(0)]], device atomic_int* ctr [[buffer(1)]], device atomic_uint* bits [[buffer(2)]],
+                        constant uint2& countCap [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  if (gid >= min(uint(atomic_load_explicit(&ctr[countCap.x], memory_order_relaxed)), countCap.y)) return;
+  uint i = bitOf(unpackB(list[gid]));
+  atomic_fetch_and_explicit(&bits[i >> 5], ~(1u << (i & 31u)), memory_order_relaxed);
+}
+
+// The uniform chunks that bricks of S lie in, once each (cbits: one bit per chunk)
+kernel void w_storageChunks(device const uint* S [[buffer(0)]], device atomic_int* ctr [[buffer(1)]], device const uint* grid [[buffer(2)]],
+                            device atomic_uint* cbits [[buffer(3)]], device uint* CL [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+  if (gid >= min(uint(atomic_load_explicit(&ctr[C_S], memory_order_relaxed)), W_MAXS)) return;
+  uint ci = chunkIdx(unpackB(S[gid]) >> 3);
+  if (!(grid[ci] & W_UNI)) return;
+  uint m = 1u << (ci & 31u);
+  if (atomic_fetch_or_explicit(&cbits[ci >> 5], m, memory_order_relaxed) & m) return;
+  int j = atomic_fetch_add_explicit(&ctr[C_CH], 1, memory_order_relaxed);
+  if (uint(j) < W_MAXC) CL[j] = ci;
+}
+
+// Each of those chunks gets a table of 512 copies of its material.
+kernel void w_expandChunks(device uint* grid [[buffer(0)]], device uint* tables [[buffer(1)]], device uint* owner [[buffer(2)]],
+                           device atomic_int* ctr [[buffer(3)]], device const uint* tableFree [[buffer(4)]], device const uint* CL [[buffer(5)]],
+                           device atomic_uint* cbits [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+  if (gid >= min(uint(atomic_load_explicit(&ctr[C_CH], memory_order_relaxed)), W_MAXC)) return;
+  uint ci = CL[gid], ce = grid[ci];
+  atomic_fetch_and_explicit(&cbits[ci >> 5], ~(1u << (ci & 31u)), memory_order_relaxed);
+  if (!(ce & W_UNI)) return;
+  uint t = alloc(ctr, C_TBUMP, C_TFREE, C_TCAP, tableFree);
+  if (t == W_NONE) return;
+  for (uint i = 0; i < 512u; i++) tables[ulong(t) * 512ul + i] = ce;
+  owner[t] = ci; grid[ci] = t;
+}
+
+// Each brick of S still stored as one material gets 512 bytes of it. One 64-thread group per brick.
+kernel void w_expandBricks(device const uint* grid [[buffer(0)]], device uint* tables [[buffer(1)]], device uint* bricks [[buffer(2)]],
+                           device atomic_int* ctr [[buffer(3)]], device const uint* brickFree [[buffer(4)]], device const uint* S [[buffer(5)]],
+                           uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  threadgroup uint idxS, fill;
+  if (tg >= min(uint(atomic_load_explicit(&ctr[C_S], memory_order_relaxed)), W_MAXS)) return;
+  int3 b = unpackB(S[tg]);
+  uint ce = grid[chunkIdx(b >> 3)];
+  if (ce & W_UNI) return;                                  // no table (the pool was full): it stays as it is
+  ulong te = ulong(ce) * 512ul + loc(b & 7);
+  uint be = tables[te];
+  if (!(be & W_UNI)) return;
+  if (t == 0u) { idxS = alloc(ctr, C_BBUMP, C_BFREE, C_BCAP, brickFree); fill = (be & 255u) * 0x01010101u; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (idxS == W_NONE) return;
+  bricks[ulong(idxS) * 128ul + t] = fill; bricks[ulong(idxS) * 128ul + t + 64u] = fill;
+  threadgroup_barrier(mem_flags::mem_device);
+  if (t == 0u) tables[te] = idxS;
+}
+
+// The step. One 64-thread group per awake brick; thread t owns the block whose low corner is
+// brick * 8 + parity + 2 * (t & 3, t >> 4, (t >> 2) & 3). A block reaches at most one cell into the brick's
+// +x/+y/+z neighbours; a cell in a brick without storage (the pool was full) counts as a wall.
+struct MoveParams { uint cur, parity, step, next; };
+kernel void w_move(device const uint* grid [[buffer(0)]], device const uint* tables [[buffer(1)]], device uchar* bricks [[buffer(2)]],
+                   device atomic_int* ctr [[buffer(3)]], device const uint* L [[buffer(4)]], device uint* next [[buffer(5)]],
+                   device uint* fresh [[buffer(6)]], device atomic_uint* bitsNext [[buffer(7)]], device const uint* bitsCur [[buffer(8)]],
+                   constant MoveParams& P [[buffer(9)]], uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  threadgroup ulong base[8];          // where the brick and its forward neighbours start in the pool (~0: no storage)
+  threadgroup atomic_uint wakeMask;   // bit (ox+1) + 3(oz+1) + 9(oy+1): the brick at that offset wakes next step
+  if (tg >= min(uint(atomic_load_explicit(&ctr[P.cur], memory_order_relaxed)), W_MAXL)) return;
+  int3 b = unpackB(L[tg]);
+  if (t < 8u) {
+    int3 n = b + int3(t & 1u, t >> 2, (t >> 1) & 1u);
+    ulong a = ~0ul;
+    if (brickInWorld(n)) {
+      uint ce = grid[chunkIdx(n >> 3)];
+      if (!(ce & W_UNI)) { uint be = tables[ulong(ce) * 512ul + loc(n & 7)]; if (!(be & W_UNI)) a = ulong(be) * 512ul; }
+    }
+    base[t] = a;
+  }
+  if (t == 0u) atomic_store_explicit(&wakeMask, 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  int3 lo = b * 8 + int(P.parity) + 2 * int3(t & 3u, t >> 4, (t >> 2) & 3u);
+  ulong addr[8];
+  uint c[8], old[8];
+  for (uint i = 0; i < 8u; i++) {                      // cell i = x + 2z + 4y of the block
+    int3 w = lo + int3(i & 1u, i >> 2, (i >> 1) & 1u);
+    int3 o = (w >> 3) - b;
+    ulong a = base[o.x + 2 * o.z + 4 * o.y];
+    addr[i] = a == ~0ul ? ~0ul : a + loc(w & 7);
+    c[i] = addr[i] == ~0ul ? uint(WALL) : uint(bricks[addr[i]]);
+    old[i] = c[i];
+  }
+  if (stepBlock(c, hash3(lo.x, lo.y, lo.z, P.step))) {
+    uint mask = 0;
+    for (uint i = 0; i < 8u; i++) {
+      if (c[i] == old[i]) continue;
+      bricks[addr[i]] = uchar(c[i]);
+      // the bricks holding this cell and its 26 neighbours
+      int3 w = lo + int3(i & 1u, i >> 2, (i >> 1) & 1u);
+      int3 o0 = ((w - 1) >> 3) - b, o1 = ((w + 1) >> 3) - b;
+      for (int oy = o0.y; oy <= o1.y; oy++) for (int oz = o0.z; oz <= o1.z; oz++) for (int ox = o0.x; ox <= o1.x; ox++)
+        mask |= 1u << uint((ox + 1) + 3 * (oz + 1) + 9 * (oy + 1));
+    }
+    atomic_fetch_or_explicit(&wakeMask, mask, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t < 27u && (atomic_load_explicit(&wakeMask, memory_order_relaxed) >> t) & 1u) {
+    int3 n = b + int3(int(t % 3u), int(t / 9u), int((t / 3u) % 3u)) - 1;
+    if (brickInWorld(n)) insertNext(n, bitsNext, bitsCur, ctr, int(P.next), next, fresh);
+  }
+}
+
+// Each brick an edit changed, and its 26 neighbours, join the next step.
+kernel void w_wake(device const uint* wake [[buffer(0)]], device atomic_int* ctr [[buffer(1)]], device atomic_uint* bitsNext [[buffer(2)]],
+                   device const uint* bitsCur [[buffer(3)]], device uint* next [[buffer(4)]], device uint* fresh [[buffer(5)]],
+                   constant uint& nextCount [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+  if (gid >= min(uint(atomic_load_explicit(&ctr[C_W], memory_order_relaxed)), W_MAXW)) return;
+  int3 b = unpackB(wake[gid]);
+  for (int i = 0; i < 27; i++) {
+    int3 n = b + int3(i % 3, i / 9, (i / 3) % 3) - 1;
+    if (brickInWorld(n)) insertNext(n, bitsNext, bitsCur, ctr, int(nextCount), next, fresh);
+  }
 }
