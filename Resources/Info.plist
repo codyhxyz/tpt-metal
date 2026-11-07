@@ -4,31 +4,31 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
-	<key>CFBundleName</key>
-	<string>BigSand</string>
 	<key>CFBundleDisplayName</key>
+	<string>BigSand</string>
+	<key>CFBundleExecutable</key>
 	<string>BigSand</string>
 	<key>CFBundleIdentifier</key>
 	<string>xyz.codyh.bigsand</string>
-	<key>CFBundleExecutable</key>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
 	<string>BigSand</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
-	<key>CFBundleInfoDictionaryVersion</key>
-	<string>6.0</string>
 	<key>CFBundleShortVersionString</key>
 	<string>0.1</string>
 	<key>CFBundleVersion</key>
 	<string>0.1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category-simulation-games</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>15.0</string>
+	<string>26.0</string>
+	<key>LSSupportsGameMode</key>
+	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
-	<key>LSApplicationCategoryType</key>
-	<string>public.app-category-simulation-games</string>
-	<key>LSSupportsGameMode</key>
-	<true/>
 </dict>
 </plist>
