@@ -218,7 +218,7 @@ final class Surfaces {
     if live, let t = tlas[cur] {
       e.setAccelerationStructure(t, bufferIndex: S.bindTLAS)
       info.enabled = 1
-      info.pad0 = UInt32(liveL)   // liquid instances in the bound TLAS (0: the render skips its liquid query)
+      info.liquids = UInt32(liveL)   // liquid instances in the bound TLAS (0: the render skips its liquid query)
     }
     e.setBytes(&info, length: MemoryLayout<SurfInfo>.stride, index: S.bindInfo)
   }

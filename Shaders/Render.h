@@ -193,9 +193,9 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
     float2 sb = qs.triangle_barycentric_coord;
     // 2. the nearest liquid surface in front of it; its normal from the triangle's corners (Surface.h's layout)
     r.max_distance = min(tS, tLim);
-    auto ql = X.intersect(r, tlas, S_MASK_LIQUID);
     float tL = 1e30f; float3 ln = float3(0, 1, 0); uint lk = WATER;
-    if (ql.type == raytracing::intersection_type::triangle) {
+    auto ql = SI.liquids ? X.intersect(r, tlas, S_MASK_LIQUID) : decltype(X.intersect(r, tlas, S_MASK_LIQUID))();
+    if (SI.liquids && ql.type == raytracing::intersection_type::triangle) {
       uint slot = ql.user_instance_id, pid = ql.primitive_id, col = pid >> 1;
       uint v = slot * uint(L_VERTS) + (col >> 5) * 33u + (col & 31u);
       float3 v0 = float3(lverts[v]), v1 = float3(lverts[v + ((pid & 1u) ? 34u : 33u)]), v2 = float3(lverts[v + ((pid & 1u) ? 1u : 34u)]);

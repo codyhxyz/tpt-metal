@@ -95,7 +95,8 @@ inline bool bitSet(device const uint* bits, uint i) { return (bits[i >> 5] >> (i
 #define S_BIND_INFO 11        // constant SurfInfo&
 struct SurfInfo {
   uint enabled;      // 0: nothing is bound at 6..10 that may be touched; draw everything from voxels
-  uint pad0, pad1, pad2;
+  uint liquids;      // liquid instances in the bound TLAS (0: no liquid query)
+  uint pad1, pad2;
 };
 
 // ---- octahedral unit normals (y up), snorm 16+16

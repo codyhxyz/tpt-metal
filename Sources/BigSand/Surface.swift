@@ -8,7 +8,7 @@ struct SurfPrim { var n0: UInt32, n1: UInt32, n2: UInt32, mat: UInt32 }
 /// One mesher job's result (32 bytes). `triCount == S.retry`: staging was full, mesh it again later.
 struct MeshOut { var mc, triCount, vtxOffset, vtxCount, triOffset, pad0, pad1, pad2: UInt32 }
 /// The render's switch for the surface bindings.
-struct SurfInfo { var enabled: UInt32 = 0, pad0: UInt32 = 0, pad1: UInt32 = 0, pad2: UInt32 = 0 }
+struct SurfInfo { var enabled: UInt32 = 0, liquids: UInt32 = 0, pad1: UInt32 = 0, pad2: UInt32 = 0 }
 
 enum S {
   static let mc = 32                       // mesh chunk side, cells
