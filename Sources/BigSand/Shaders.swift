@@ -348,11 +348,24 @@ kernel void render(texture2d<float, access::write> out [[texture(0)]],
   float th = trace(o, d, tFloor, vox, HF, tb, sb, n, cell, steps);
   float3 col; float tt;
   if (th >= 0) {
+    // The pile is a smooth surface stored as whole-cell heights: light it with its real slope (central differences
+    // of the heights), not the 1 cm stair faces, whose risers alias into contour rings at a distance.
+    int pile = int(HF[colIdx(cell.x, cell.z)]);
+    bool onPile = cell.y < pile;
+    if (onPile) {
+      int xl = max(cell.x - 1, 0), xr = min(cell.x + 1, WX - 1), zl = max(cell.z - 1, 0), zr = min(cell.z + 1, WZ - 1);
+      float gx = (float(HF[colIdx(xr, cell.z)]) - float(HF[colIdx(xl, cell.z)])) / float(xr - xl);
+      float gz = (float(HF[colIdx(cell.x, zr)]) - float(HF[colIdx(cell.x, zl)])) / float(zr - zl);
+      n = normalize(float3(-gx, 1.0f, -gz));
+    }
+    // Grain colour varies per cell; a pixel covering k x k grains shows their average, which varies 1/k as much
+    // (the mipmap rule), so the variation fades with the pixel's footprint instead of shimmering.
+    float footprint = th * 2.0f * C.tanHalf / float(H);          // cells per pixel at the hit
     float h = float(pcg(uint(cell.x) ^ pcg(uint(cell.y) ^ pcg(uint(cell.z)))) & 1023u) / 1023.0f;
-    float3 base = float3(0.78, 0.62, 0.38) * (0.75f + 0.4f * h);
+    float3 base = float3(0.78, 0.62, 0.38) * (0.95f + (0.4f * h - 0.2f) / max(1.0f, footprint));
     float lam = max(dot(n, L), 0.0f), sh = 1.0f;
-    if (C.shadows != 0u && lam > 0) { float3 n2; int3 c2; if (trace(o + d * th + n * 0.01f, L, 1e30f, vox, HF, tb, sb, n2, c2, steps) >= 0) sh = 0.0f; }
-    col = base * (sky * (n.y > 0.5f ? 0.40f : 0.28f) + sunCol * lam * sh);
+    if (C.shadows != 0u && lam > 0) { float3 n2; int3 c2; if (trace(o + d * th + n * (onPile ? 1.5f : 0.01f), L, 1e30f, vox, HF, tb, sb, n2, c2, steps) >= 0) sh = 0.0f; }   // from the smooth surface, clear of its 1 cm steps
+    col = base * (sky * mix(0.28f, 0.40f, saturate(n.y)) + sunCol * lam * sh);
     tt = th;
   } else if (tFloor < 1e29f) {
     float3 fp = o + d * tFloor;
