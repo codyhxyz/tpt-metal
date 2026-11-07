@@ -4,6 +4,9 @@ import Foundation
 import QuartzCore
 
 /// An edit, as the shaders see it (Shaders/World.metal, `WEdit`).
+/// The water pass's parameters (Shaders/World.metal, `WaterParams`): counts and phase, then G and damping.
+struct WaterParams { var u: SIMD4<UInt32>; var f: SIMD4<Float> }
+
 /// Indirect dispatch arguments for a list, and counters to zero (Shaders/World.metal, `ArgSpec`).
 struct ArgSpec { var a: SIMD4<UInt32>; var zero: SIMD4<UInt32> }
 
@@ -70,9 +73,16 @@ final class World {
     case tBump = 0, bBump, tFree, bFree, cand, over, tCap, bCap, args, steps = 11, pick = 12
     case list0 = 20, list1, fresh, storage, chunkList, wake
     case aFresh = 26, aStorage = 29, aChunks = 32, aBricks = 35, aMove = 38, aWake = 41, aClear = 44
+    case fBump = 48, fFree, fCap
   }
   // list capacities (W_MAX* in Shaders/World.metal)
   static let maxL: UInt32 = 1 << 20, maxN: UInt32 = 1 << 18, maxS: UInt32 = 1 << 21, maxC: UInt32 = 1 << 16, maxW: UInt32 = 1 << 16
+  static let maxF = 1 << 18   // bricks with flowing water at most (W_MAXF)
+  /// Cell size in metres, for gravity in the water's flow.
+  static let cellMetres = 0.3
+  /// How much of its flow water keeps each step. Not derived: water's real viscosity is negligible at this scale,
+  /// and this damping is what lets waves die down and water go back to sleep.
+  static let waterDamp: Float = 0.99
 
   let NW: Int, NH: Int
   let device: MTLDevice, queue: MTLCommandQueue, q4: MTL4CommandQueue
@@ -80,12 +90,18 @@ final class World {
   private var mapValue: UInt64 = 0, waitedValue: UInt64 = 0
   let grid, owner, tableFree, brickFree, ctr: MTLBuffer
   let tables, bricks: SparsePool
+  /// One flow slot index per table entry (0: none), the same layout as `tables`.
+  let slots: SparsePool
+  /// Water flow per column of a brick with flowing water: 64 x half4; and the slots' free stack.
+  let flows, flowFree: MTLBuffer
   let pHeight, pSurface, pBands, pChunks, pBrickClass, pCandArgs, pBrickFill, pCollapse: MTLComputePipelineState
   let pEditChunks, pFixFree, pEditBricks, pRender: MTLComputePipelineState
   // physics (Shaders/World.metal, "Physics")
   let lists: [MTLBuffer], bits: [MTLBuffer]      // the awake list and its bitmap, this step's and the next
   let fresh, storage, chunkList, wake, cbits: MTLBuffer
-  let pArgs, pStorageList, pClearBits, pStorageChunks, pExpandChunks, pExpandBricks, pMove, pWake: MTLComputePipelineState
+  /// Per brick of this step's list: did the move pass see water in it (the water pass skips dry bricks).
+  let wetFlag: MTLBuffer
+  let pArgs, pStorageList, pClearBits, pStorageChunks, pExpandChunks, pExpandBricks, pMove, pWake, pWater, pRetire: MTLComputePipelineState
   private var li = 0, stepNo: UInt32 = 0, stepDebt = 0.0, lastFrame = CACurrentMediaTime()
   /// Physics steps per second: the time scale of falling, since a step moves a grain at most one cell. Set by eye
   /// while playing (`,` halves it, `.` doubles it).
@@ -125,7 +141,7 @@ final class World {
     pRender = try k("w_render")
     pArgs = try k("w_args"); pStorageList = try k("w_storageList"); pClearBits = try k("w_clearBits")
     pStorageChunks = try k("w_storageChunks"); pExpandChunks = try k("w_expandChunks"); pExpandBricks = try k("w_expandBricks")
-    pMove = try k("w_move"); pWake = try k("w_wake")
+    pMove = try k("w_move"); pWake = try k("w_wake"); pWater = try k("w_water"); pRetire = try k("w_retire")
     let rp = MTLRenderPipelineDescriptor()
     rp.vertexFunction = try fn("w_presentV"); rp.fragmentFunction = try fn("w_presentF")
     rp.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
@@ -138,8 +154,12 @@ final class World {
     brickFree = dev.makeBuffer(length: (16 << 20) * 4, options: .storageModePrivate)!   // 16 M freed bricks outstanding
     ctr = dev.makeBuffer(length: 64 * 4, options: .storageModeShared)!
     tables = SparsePool(dev, virtualBytes: nChunks * 2048, elem: 2048)
+    slots = SparsePool(dev, virtualBytes: nChunks * 2048, elem: 2048)
+    flows = dev.makeBuffer(length: World.maxF * 64 * 8, options: .storageModePrivate)!
+    flowFree = dev.makeBuffer(length: World.maxF * 4, options: .storageModePrivate)!
     bricks = SparsePool(dev, virtualBytes: 64 << 30, elem: 512)                      // up to 128 M bricks
-    residency.addAllocation(tables.buffer); residency.addAllocation(bricks.buffer)
+    residency.addAllocation(tables.buffer); residency.addAllocation(bricks.buffer); residency.addAllocation(slots.buffer)
+    residency.addAllocation(flows); residency.addAllocation(flowFree)
     func priv(_ n: Int) -> MTLBuffer { dev.makeBuffer(length: n, options: .storageModePrivate)! }
     lists = [priv(Int(World.maxL) * 4), priv(Int(World.maxL) * 4)]
     let brickBits = (NW / 8) * (NH / 8) * (NW / 8)
@@ -147,7 +167,8 @@ final class World {
     fresh = priv(Int(World.maxN) * 4); storage = priv(Int(World.maxS) * 4)
     chunkList = priv(Int(World.maxC) * 4); wake = priv(Int(World.maxW) * 4)
     cbits = priv((nChunks + 31) / 32 * 4)
-    for b in [grid, owner, tableFree, brickFree, ctr, fresh, storage, chunkList, wake, cbits] + lists + bits { residency.addAllocation(b) }
+    wetFlag = priv(Int(World.maxL))
+    for b in [grid, owner, tableFree, brickFree, ctr, fresh, storage, chunkList, wake, cbits, wetFlag] + lists + bits { residency.addAllocation(b) }
     residency.commit()
     generate()
   }
@@ -170,14 +191,16 @@ final class World {
   }
   /// Maps pool memory so `t` tables and `b` bricks fit; the next command buffer waits for it.
   private func reserve(tables t: Int, bricks b: Int) {
-    let grewT = tables.grow(to: t, dev: device, q4: q4, rs: residency)
+    let grewTables = tables.grow(to: t, dev: device, q4: q4, rs: residency)
+    let grewSlots = slots.grow(to: t, dev: device, q4: q4, rs: residency)
+    let grewT = grewTables || grewSlots
     let grewB = bricks.grow(to: b, dev: device, q4: q4, rs: residency)
     if grewT || grewB {
       residency.commit()
       mapValue += 1
       q4.signalEvent(mapEvent, value: mapValue)
     }
-    setCounter(.tCap, tables.capacity); setCounter(.bCap, bricks.capacity)
+    setCounter(.tCap, tables.capacity); setCounter(.bCap, bricks.capacity); setCounter(.fCap, World.maxF)
   }
   /// Tables and bricks in use (handed out minus freed).
   var tablesUsed: Int { counter(.tBump) - counter(.tFree) }
@@ -263,6 +286,7 @@ final class World {
     // physics: nothing awake
     let cb = makeCommandBuffer(), bl = cb.makeBlitCommandEncoder()!
     for b in bits + [cbits] { bl.fill(buffer: b, range: 0..<b.length, value: 0) }
+    bl.fill(buffer: slots.buffer, range: 0..<slots.mappedBytes, value: 0)       // no table has a flow slot yet
     bl.endEncoding(); cb.commit(); cb.waitUntilCompleted()
     li = 0; stepNo = 0; stepDebt = 0
     genWall = CACurrentMediaTime() - t0
@@ -287,7 +311,7 @@ final class World {
     func fix() { e.setComputePipelineState(pFixFree); e.setBuffer(ctr, offset: 0, index: 0); e.dispatchThreads(one, threadsPerThreadgroup: one)
                  e.setBuffer(grid, offset: 0, index: 0) }
     e.setComputePipelineState(pEditChunks)
-    e.setBuffer(owner, offset: 0, index: 2); e.setBuffer(tableFree, offset: 0, index: 4)
+    e.setBuffer(owner, offset: 0, index: 2); e.setBuffer(tableFree, offset: 0, index: 4); e.setBuffer(slots.buffer, offset: 0, index: 6)
     e.dispatchThreads(chunkGrid, threadsPerThreadgroup: one)
     fix()
     e.setComputePipelineState(pEditBricks)
@@ -348,7 +372,7 @@ final class World {
     run(pClearBits, .aStorage, [storage, ctr, bits[nxt]])
     run(pStorageChunks, .aStorage, [storage, ctr, grid, cbits, chunkList])
     args(C.chunkList.rawValue, per: 64, arg: .aChunks, cap: World.maxC)
-    run(pExpandChunks, .aChunks, [grid, tables.buffer, owner, ctr, tableFree, chunkList, cbits])
+    run(pExpandChunks, .aChunks, [grid, tables.buffer, owner, ctr, tableFree, chunkList, cbits, slots.buffer])
     fixFree()
     args(C.storage.rawValue, per: 1, arg: .aBricks, cap: World.maxS)
     run(pExpandBricks, .aBricks, [grid, tables.buffer, bricks.buffer, ctr, brickFree, storage])
@@ -356,18 +380,27 @@ final class World {
     // 2. move (the lists of fresh bricks, storage and chunks are used up; the next list starts empty)
     args(curCount, per: 1, arg: .aMove, cap: World.maxL, zero: [C.fresh.rawValue, C.storage.rawValue, C.chunkList.rawValue, nextCount])
     var mp = SIMD4<UInt32>(UInt32(curCount), stepNo & 1, stepNo, UInt32(nextCount))
-    e.setBytes(&mp, length: 16, index: 9)
+    e.setBytes(&mp, length: 16, index: 9); e.setBuffer(wetFlag, offset: 0, index: 10)
     run(pMove, .aMove, [grid, tables.buffer, bricks.buffer, ctr, lists[cur], lists[nxt], fresh, bits[nxt], bits[cur]])
+    // 2b. water flows by its head (the same bricks; the phase picks this step's pairs of columns)
+    let dt = 1.0 / stepRate
+    var wp = WaterParams(u: SIMD4(UInt32(curCount), stepNo & 3, UInt32(nextCount), 0),
+                         f: SIMD4(Float(9.8 * dt * dt / World.cellMetres), World.waterDamp, 0, 0))
+    e.setBytes(&wp, length: MemoryLayout<WaterParams>.stride, index: 12); e.setBuffer(wetFlag, offset: 0, index: 13)
+    run(pWater, .aMove, [grid, tables.buffer, bricks.buffer, ctr, lists[cur], lists[nxt], fresh, bits[nxt], bits[cur], slots.buffer, flows, flowFree])
+    fixFree()
     // 3. bricks edits changed
     args(C.wake.rawValue, per: 64, arg: .aWake, cap: World.maxW)
     var nc = UInt32(nextCount)
     e.setBytes(&nc, length: 4, index: 6)
     run(pWake, .aWake, [wake, ctr, bits[nxt], bits[cur], lists[nxt], fresh])
-    // 4. this step's bitmap back to clear (the edits' list is used up)
+    // 4. this step's bitmap back to clear; bricks that fell asleep give back their flow slots (the edits' list is used up)
     args(curCount, per: 64, arg: .aClear, cap: World.maxL, zero: [C.wake.rawValue])
     var lc = SIMD2<UInt32>(UInt32(curCount), World.maxL)
     e.setBytes(&lc, length: 8, index: 3)
-    run(pClearBits, .aClear, [lists[cur], ctr, bits[cur]])
+    e.setBuffer(bits[nxt], offset: 0, index: 4); e.setBuffer(grid, offset: 0, index: 5)
+    e.setBuffer(slots.buffer, offset: 0, index: 6); e.setBuffer(flowFree, offset: 0, index: 7)
+    run(pRetire, .aClear, [lists[cur], ctr, bits[cur]])
     e.endEncoding()
     li = nxt; stepNo &+= 1
   }
