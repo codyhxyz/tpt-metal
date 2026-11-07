@@ -2,6 +2,7 @@ import AppKit
 import MetalKit
 import ImageIO
 import UniformTypeIdentifiers
+import MetalFX
 
 // BigSand: a cube of sand falls and piles up.
 //   swift run -c release BigSand                 window: WASD/QE fly, drag to look, Shift fast, R drop again, Space pause, F shadows
@@ -40,12 +41,14 @@ func shots(ticks: Int, outDir: String) throws {
   let tex = e.device.makeTexture(descriptor: td)!
   td.pixelFormat = .r32Float
   let depth = e.device.makeTexture(descriptor: td)!
+  td.pixelFormat = .rg16Float
+  let motion = e.device.makeTexture(descriptor: td)!
   var cam = FlyCam().uniforms(aspect: 1512.0 / 982.0, shadows: true)
   let at: Set<Int> = [60, 90, 110, 140, 200, 300, ticks - 1]
   for i in 0..<ticks {
     let cb = e.queue.makeCommandBuffer()!
     e.encodeTick(cb)
-    if at.contains(i) { e.encodeRender(cb, to: tex, depth: depth, cam: &cam) }
+    if at.contains(i) { var same = cam; e.encodeRender(cb, to: tex, depth: depth, motion: motion, cam: &cam, prev: &same) }
     cb.commit(); cb.waitUntilCompleted()
     if at.contains(i) { savePNG(tex, e, "\(outDir)/tick-\(i).png") }
   }
@@ -67,7 +70,8 @@ final class View: MTKView {
 
 final class Renderer: NSObject, MTKViewDelegate {
   let e: Engine; var cam = FlyCam(); var tex: MTLTexture?
-  var depth: MTLTexture?, history: [MTLTexture] = [], hcur = 0, prev = Cam(), valid = false, frame = 0
+  var depth: MTLTexture?, motion: MTLTexture?, output: MTLTexture?, scaler: MTLFXTemporalScaler?
+  var prev = Cam(), valid = false, frame = 0
   var running = true, shadows = true
   var last = CACurrentMediaTime(), lastTitle = CACurrentMediaTime()
   var simMs: [Double] = [], drawMs: [Double] = [], act: [Int] = []
@@ -88,19 +92,28 @@ final class Renderer: NSObject, MTKViewDelegate {
       case 2: cam.pos += r * speed; case 0: cam.pos -= r * speed
       case 14: cam.pos.y += speed; case 12: cam.pos.y -= speed
       default: break } }
-    if v.keys.remove(15) != nil { e.reset() }                 // R
+    if v.keys.remove(15) != nil { e.reset(); valid = false }  // R: drop it again (and start MetalFX's history over)
     if v.keys.remove(49) != nil { running.toggle() }          // Space
     if v.keys.remove(3) != nil { shadows.toggle() }           // F
 
-    let w = Int(view.drawableSize.width) / 2, h = Int(view.drawableSize.height) / 2
-    if tex == nil || tex!.width != w || tex!.height != h {
-      let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: max(w, 1), height: max(h, 1), mipmapped: false)
-      td.usage = [.shaderWrite, .shaderRead]; td.storageMode = .private
-      tex = e.device.makeTexture(descriptor: td)
-      history = [e.device.makeTexture(descriptor: td)!, e.device.makeTexture(descriptor: td)!]
-      td.pixelFormat = .r32Float
-      depth = e.device.makeTexture(descriptor: td)
-      valid = false
+    // Rays at half the window's resolution; MetalFX's temporal scaler turns them into an antialiased full-resolution frame.
+    let W = max(Int(view.drawableSize.width), 2), H = max(Int(view.drawableSize.height), 2), w = W / 2, h = H / 2
+    if scaler == nil || output!.width != W || output!.height != H {
+      let d = MTLFXTemporalScalerDescriptor()
+      d.inputWidth = w; d.inputHeight = h; d.outputWidth = W; d.outputHeight = H
+      d.colorTextureFormat = .rgba16Float; d.depthTextureFormat = .r32Float
+      d.motionTextureFormat = .rg16Float; d.outputTextureFormat = .rgba16Float
+      guard let s = d.makeTemporalScaler(device: e.device) else { fatalError("MetalFX refused this temporal scaler setup") }
+      func make(_ f: MTLPixelFormat, _ ww: Int, _ hh: Int, _ use: MTLTextureUsage) -> MTLTexture {
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: f, width: ww, height: hh, mipmapped: false)
+        td.usage = use; td.storageMode = .private
+        return e.device.makeTexture(descriptor: td)!
+      }
+      tex = make(.rgba16Float, w, h, s.colorTextureUsage.union(.shaderWrite))
+      depth = make(.r32Float, w, h, s.depthTextureUsage.union(.shaderWrite))
+      motion = make(.rg16Float, w, h, s.motionTextureUsage.union(.shaderWrite))
+      output = make(.rgba16Float, W, H, s.outputTextureUsage.union(.shaderRead))
+      scaler = s; valid = false
     }
     if running {
       let cs = e.queue.makeCommandBuffer()!
@@ -117,11 +130,19 @@ final class Renderer: NSObject, MTKViewDelegate {
     func halton(_ i: Int, _ b: Int) -> Float { var f: Float = 1, r: Float = 0, n = i; while n > 0 { f /= Float(b); r += f * Float(n % b); n /= b }; return r }
     frame += 1
     u.jitter = SIMD2(halton(frame % 16 + 1, 2) - 0.5, halton(frame % 16 + 1, 3) - 0.5)
+    if !valid { prev = u }
     let cr = e.queue.makeCommandBuffer()!
-    e.encodeRender(cr, to: tex!, depth: depth!, cam: &u)
-    e.encodeResolve(cr, raw: tex!, depth: depth!, history: history[hcur], into: history[1 - hcur], cam: &u, prev: &prev, valid: valid)
-    hcur = 1 - hcur; prev = u; valid = true
-    e.encodePresent(cr, from: history[hcur], pass: pass)
+    e.encodeRender(cr, to: tex!, depth: depth!, motion: motion!, cam: &u, prev: &prev)
+    let s = scaler!
+    s.colorTexture = tex; s.depthTexture = depth; s.motionTexture = motion; s.outputTexture = output
+    s.inputContentWidth = w; s.inputContentHeight = h
+    s.jitterOffsetX = u.jitter.x; s.jitterOffsetY = u.jitter.y
+    s.motionVectorScaleX = 1; s.motionVectorScaleY = 1
+    s.isDepthReversed = true
+    s.reset = !valid
+    s.encode(commandBuffer: cr)
+    prev = u; valid = true
+    e.encodePresent(cr, from: output!, pass: pass)
     cr.present(drawable)
     cr.addCompletedHandler { [weak self] cb in
       guard let self else { return }

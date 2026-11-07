@@ -24,7 +24,7 @@ final class Engine {
   let device: MTLDevice, queue: MTLCommandQueue
   let vox, HF, FV, air, countdown, awake, active, args, args2, tileBounds, superBounds, stepsOut, censusOut: MTLBuffer
   let V: [MTLBuffer], Q: [MTLBuffer], changed: [MTLBuffer]
-  let pPlan, pFlowArgs, pFall, pFlow, pSurface, pSuper, pSeed, pCensus, pRender, pResolve: MTLComputePipelineState
+  let pPlan, pFlowArgs, pFall, pFlow, pSurface, pSuper, pSeed, pCensus, pRender: MTLComputePipelineState
   let pPresent: MTLRenderPipelineState
   var cur = 0
   var tick: UInt32 = 0
@@ -39,7 +39,7 @@ final class Engine {
     let lib = try dev.makeLibrary(source: shaderSource(wx: 4096, wz: 4096, words: 32, substeps: 12), options: nil)
     func k(_ n: String) throws -> MTLComputePipelineState { try dev.makeComputePipelineState(function: lib.makeFunction(name: n)!) }
     pPlan = try k("plan"); pFlowArgs = try k("flowArgs"); pFall = try k("fall"); pFlow = try k("flow")
-    pSurface = try k("surface"); pSuper = try k("superBounds"); pSeed = try k("seed"); pCensus = try k("census"); pRender = try k("render"); pResolve = try k("resolve")
+    pSurface = try k("surface"); pSuper = try k("superBounds"); pSeed = try k("seed"); pCensus = try k("census"); pRender = try k("render")
     let rp = MTLRenderPipelineDescriptor()
     rp.vertexFunction = lib.makeFunction(name: "presentV"); rp.fragmentFunction = lib.makeFunction(name: "presentF")
     rp.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
@@ -140,27 +140,16 @@ final class Engine {
   /// Active tiles of the last completed tick (read after its command buffer finished).
   var activeTiles: Int { Int(args.contents().load(as: UInt32.self)) }
 
-  func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, cam: inout Cam) {
+  /// Rays at the input resolution: colour, reversed depth and motion (from `prev`, last frame's camera) for MetalFX.
+  func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, motion: MTLTexture, cam: inout Cam, prev: inout Cam) {
     let e = cb.makeComputeCommandEncoder()!
     e.setComputePipelineState(pRender)
-    e.setTexture(tex, index: 0); e.setTexture(depth, index: 1)
+    e.setTexture(tex, index: 0); e.setTexture(depth, index: 1); e.setTexture(motion, index: 2)
+    e.setBytes(&prev, length: MemoryLayout<Cam>.stride, index: 6)
     e.setBuffer(vox, offset: 0, index: 0); e.setBuffer(HF, offset: 0, index: 1); e.setBuffer(tileBounds, offset: 0, index: 2)
     e.setBuffer(superBounds, offset: 0, index: 3); e.setBytes(&cam, length: MemoryLayout<Cam>.stride, index: 4)
     e.setBuffer(stepsOut, offset: 0, index: 5)
     e.dispatchThreads(MTLSize(width: tex.width, height: tex.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-    e.endEncoding()
-  }
-
-  /// Temporal antialiasing: blend this frame's jittered samples into the reprojected history.
-  func encodeResolve(_ cb: MTLCommandBuffer, raw: MTLTexture, depth: MTLTexture, history: MTLTexture, into out: MTLTexture,
-                     cam: inout Cam, prev: inout Cam, valid: Bool) {
-    var v: UInt32 = valid ? 1 : 0
-    let e = cb.makeComputeCommandEncoder()!
-    e.setComputePipelineState(pResolve)
-    e.setTexture(raw, index: 0); e.setTexture(depth, index: 1); e.setTexture(history, index: 2); e.setTexture(out, index: 3)
-    e.setBytes(&cam, length: MemoryLayout<Cam>.stride, index: 0); e.setBytes(&prev, length: MemoryLayout<Cam>.stride, index: 1)
-    e.setBytes(&v, length: 4, index: 2)
-    e.dispatchThreads(MTLSize(width: raw.width, height: raw.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
     e.endEncoding()
   }
 

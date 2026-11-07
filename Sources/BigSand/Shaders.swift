@@ -331,10 +331,14 @@ float trace(float3 o, float3 d, float tMax, device const ulong* vox, device cons
   return -1.0f;
 }
 
+// Writes MetalFX's inputs: colour, depth (reversed: NEAR / view distance, 0 = sky), and motion: per pixel, how many
+// pixels away this surface point was on the previous frame (its spot under the previous camera minus its spot now).
+#define NEAR 1.0f
 kernel void render(texture2d<float, access::write> out [[texture(0)]], texture2d<float, access::write> depthOut [[texture(1)]],
+                   texture2d<float, access::write> motionOut [[texture(2)]],
                    device const ulong* vox [[buffer(0)]], device const uint* HF [[buffer(1)]], device const uint2* tb [[buffer(2)]],
                    device const uint2* sb [[buffer(3)]], constant Cam& C [[buffer(4)]], device atomic_uint* stepsOut [[buffer(5)]],
-                   uint2 g [[thread_position_in_grid]]) {
+                   constant Cam& P [[buffer(6)]], uint2 g [[thread_position_in_grid]]) {
   uint W = out.get_width(), H = out.get_height();
   if (g.x >= W || g.y >= H) return;
   float2 uv = (float2(g) + 0.5f + C.jitter) / float2(W, H) * 2.0f - 1.0f; uv.y = -uv.y;   // jittered within the pixel (TAA)
@@ -380,44 +384,20 @@ kernel void render(texture2d<float, access::write> out [[texture(0)]], texture2d
   if (tt < 1e29f) col = mix(col, sky, 1.0f - exp(-tt / 30000.0f));
   if (C.stats != 0u) atomic_fetch_add_explicit(stepsOut, steps, memory_order_relaxed);
   out.write(float4(col, 1.0f), g);
-  depthOut.write(float4(tt < 1e29f ? tt : 1e9f), g);
+  float dist = tt < 1e29f ? tt : 1e9f;
+  depthOut.write(float4(tt < 1e29f ? NEAR / max(dist * dot(d, C.fwd.xyz), NEAR) : 0.0f), g);
+  float3 v = o + d * dist - P.pos.xyz;
+  float z = dot(v, P.fwd.xyz);
+  float2 motion = float2(0.0f);
+  if (z > 0.0f) {
+    float2 q = float2(dot(v, P.right.xyz) / (z * P.tanHalf * P.aspect), dot(v, P.up.xyz) / (z * P.tanHalf));
+    float2 prevPx = float2(q.x * 0.5f + 0.5f, 0.5f - q.y * 0.5f) * float2(W, H);
+    motion = prevPx - (float2(g) + 0.5f + C.jitter);
+  }
+  motionOut.write(float4(motion, 0.0f, 0.0f), g);
 }
 
-// --- temporal antialiasing: each frame samples a different point inside every pixel; this pass finds where the
-// pixel's surface point was on last frame's screen, takes the accumulated colour there, clamps it to the range of
-// this frame's 3x3 neighbourhood (so moving things don't smear), and blends in 10% of the new sample. Over a few
-// frames every pixel becomes the average over its footprint: what removes moire from sub-pixel detail.
-#define TAA_NEW 0.1f
-kernel void resolve(texture2d<float, access::read> raw [[texture(0)]], texture2d<float, access::read> depth [[texture(1)]],
-                    texture2d<float, access::sample> hist [[texture(2)]], texture2d<float, access::write> outHist [[texture(3)]],
-                    constant Cam& C [[buffer(0)]], constant Cam& P [[buffer(1)]], constant uint& valid [[buffer(2)]],
-                    uint2 g [[thread_position_in_grid]]) {
-  uint W = raw.get_width(), H = raw.get_height();
-  if (g.x >= W || g.y >= H) return;
-  float3 cur = raw.read(g).rgb, lo = cur, hi = cur;
-  for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
-    float3 c = raw.read(uint2(clamp(int2(g) + int2(dx, dy), int2(0), int2(W - 1, H - 1)))).rgb;
-    lo = min(lo, c); hi = max(hi, c);
-  }
-  float3 col = cur;
-  if (valid != 0u) {
-    float2 uv = (float2(g) + 0.5f) / float2(W, H) * 2.0f - 1.0f; uv.y = -uv.y;
-    float3 d = normalize(C.fwd.xyz + uv.x * C.tanHalf * C.aspect * C.right.xyz + uv.y * C.tanHalf * C.up.xyz);
-    float3 v = C.pos.xyz + d * depth.read(g).r - P.pos.xyz;
-    float z = dot(v, P.fwd.xyz);
-    if (z > 0.0f) {
-      float2 q = float2(dot(v, P.right.xyz) / (z * P.tanHalf * P.aspect), dot(v, P.up.xyz) / (z * P.tanHalf));
-      float2 puv = float2(q.x * 0.5f + 0.5f, 0.5f - q.y * 0.5f);
-      if (all(puv >= 0.0f) && all(puv <= 1.0f)) {
-        constexpr sampler s(filter::linear, address::clamp_to_edge);
-        col = mix(clamp(hist.sample(s, puv).rgb, lo, hi), cur, TAA_NEW);
-      }
-    }
-  }
-  outHist.write(float4(col, 1.0f), g);
-}
-
-// --- present: stretch the half-resolution frame over the window
+// --- present: copy MetalFX's full-resolution output to the window
 struct VOut { float4 pos [[position]]; float2 uv; };
 vertex VOut presentV(uint vid [[vertex_id]]) {
   float2 p = float2((vid << 1) & 2, vid & 2);
