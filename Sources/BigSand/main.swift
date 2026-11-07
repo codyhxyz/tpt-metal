@@ -110,8 +110,8 @@ protocol Scene: AnyObject {
   func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, motion: MTLTexture, cam: inout Cam, prev: inout Cam)
   func encodePresent(_ cb: MTLCommandBuffer, from tex: MTLTexture, pass: MTLRenderPassDescriptor)
   func key(_ code: UInt16, shift: Bool) -> Bool   // true if it handled the key
-  /// GPU ms of physics, surfaces and rays (medians over the last half second).
-  func title(frameMs: Double, meshMs: Double, drawMs: Double) -> String
+  /// What the window title adds after the timings: a few words.
+  func title() -> String
   /// Back to the start: the cube hangs in the sky again; the island is generated afresh.
   func reset()
 }
@@ -122,9 +122,7 @@ extension Engine: Scene {
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { encodeTick(cb); return true }
   func encodeSurfaces(_ cb: MTLCommandBuffer, render: MTLCommandBuffer, cam: Cam) -> Bool { false }
   func key(_ code: UInt16, shift: Bool) -> Bool { if code == 15 { reset(); return true }; return false }   // R: drop it again
-  func title(frameMs: Double, meshMs: Double, drawMs: Double) -> String {
-    String(format: "BigSand · %.2f billion grains · physics %.2f ms · draw %.2f ms · %d tiles awake", Double(grains) / 1e9, frameMs, drawMs, activeTiles)
-  }
+  func title() -> String { String(format: "%.2f G grains", Double(grains) / 1e9) }
 }
 
 extension World: Scene {
@@ -148,10 +146,7 @@ extension World: Scene {
     if code == 47 { stepRate = min(480, stepRate * 2); return true }    // .
     return false
   }
-  func title(frameMs: Double, meshMs: Double, drawMs: Double) -> String {
-    String(format: "Island %d x %d x %d · %.2f GB · GPU: physics %.2f ms (%g steps/s, %d bricks awake), surfaces %.2f ms, rays %.2f ms · tool: %@, radius %d",
-           NW, NH, NW, Double(bytes) / 1e9, frameMs, stepRate, awakeBricks, meshMs, drawMs, World.names[Int(material)] as NSString, radius)
-  }
+  func title() -> String { "\(World.names[Int(material)]) r\(radius)" }
 }
 
 final class View: MTKView {
@@ -289,9 +284,9 @@ final class Renderer: NSObject, MTKViewDelegate {
       simMs.removeAll(); meshMs.removeAll(); drawMs.removeAll(); lock.unlock()
       let cpu = median(cpuMs), fr = median(frameMs), worst = frameMs.max() ?? 0
       cpuMs.removeAll(); frameMs.removeAll()
-      window?.title = e.title(frameMs: sm, meshMs: mm, drawMs: d)
-        + String(format: " · CPU %.2f ms · frame %.1f ms (worst %.1f)", cpu, fr, worst)
-        + " · rays \(w) x \(h) -> \(W) x \(H)" + (running ? "" : " · paused")
+      // ms: GPU physics, surfaces, rays; CPU; frame interval (worst)
+      window?.title = String(format: "phys %.1f · surf %.1f · rays %.1f · cpu %.1f · frame %.1f (%.0f) ms · ", sm, mm, d, cpu, fr, worst)
+        + e.title() + (running ? "" : " · paused")
     }
   }
 }
