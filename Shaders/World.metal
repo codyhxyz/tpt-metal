@@ -480,12 +480,18 @@ kernel void w_fixFree(device atomic_int* ctr [[buffer(0)]]) {
   }
 }
 
+// Dirty marks for the smooth surfaces (defined in SurfaceJobs.h): a change that makes or unmakes a solid, or changes
+// a solid's material, dirties solids; any change dirties liquids.
+inline uint sAxisBits(int3 l);
+inline void sMarkDirty(int3 org, uint bits, uint t, device atomic_uint* dirty);
+
 // 2. Each brick the sphere touches, one 128-thread group, 4 cells per thread: new cells; uniform bricks that change
 //    get storage.
 kernel void w_editBricks(device uint* grid [[buffer(0)]], device uint* tables [[buffer(1)]], device uint* bricks [[buffer(2)]],
                          device atomic_int* ctr [[buffer(3)]], device const uint* brickFree [[buffer(4)]], constant WEdit& E [[buffer(5)]],
-                         device uint* wake [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
-  threadgroup atomic_uint changed;
+                         device uint* wake [[buffer(6)]], device atomic_uint* solidDirty [[buffer(15)]], device atomic_uint* liquidDirty [[buffer(16)]],
+                         uint3 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  threadgroup atomic_uint changed, sBitsS, lBitsS;   // any change; the changed cells per axis (sAxisBits): solids, anything
   threadgroup uint idxS;
   int3 bc = E.brickLo.xyz + int3(tg);
   if (any(bc < 0) || bc.x >= W_BX || bc.y >= NH / 8 || bc.z >= W_BX || !boxTouches(bc * 8, 8, E)) return;
@@ -493,18 +499,29 @@ kernel void w_editBricks(device uint* grid [[buffer(0)]], device uint* tables [[
   if (ce & W_UNI) return;                         // step 1 gave a table to every chunk this edit changes
   ulong te = ulong(ce) * 512ul + loc(bc & 7);
   uint be = tables[te];
-  if (t == 0u) atomic_store_explicit(&changed, 0u, memory_order_relaxed);
+  if (t == 0u) {
+    atomic_store_explicit(&changed, 0u, memory_order_relaxed);
+    atomic_store_explicit(&sBitsS, 0u, memory_order_relaxed); atomic_store_explicit(&lBitsS, 0u, memory_order_relaxed);
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint old = (be & W_UNI) ? (be & 255u) * 0x01010101u : bricks[ulong(be) * 128ul + t];
   int y = int(t >> 4), z = int((t >> 1) & 7u), x0 = int(t & 1u) * 4;
-  uint packed = 0;
+  uint packed = 0, sb = 0, lb = 0;
   for (int i = 0; i < 4; i++) {
     int3 d = bc * 8 + int3(x0 + i, y, z) - E.c.xyz;
-    packed |= applyEdit((old >> (8 * i)) & 255u, d.x * d.x + d.y * d.y + d.z * d.z <= E.r2, E) << (8 * i);
+    uint o = (old >> (8 * i)) & 255u, n = applyEdit(o, d.x * d.x + d.y * d.y + d.z * d.z <= E.r2, E);
+    packed |= n << (8 * i);
+    if (n != o) { uint ab = sAxisBits(int3(x0 + i, y, z)); lb |= ab; if (solid(n) || solid(o)) sb |= ab; }
   }
-  if (packed != old) atomic_store_explicit(&changed, 1u, memory_order_relaxed);
+  if (packed != old) {
+    atomic_store_explicit(&changed, 1u, memory_order_relaxed);
+    atomic_fetch_or_explicit(&lBitsS, lb, memory_order_relaxed);
+    if (sb) atomic_fetch_or_explicit(&sBitsS, sb, memory_order_relaxed);
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (atomic_load_explicit(&changed, memory_order_relaxed) == 0u) return;
+  sMarkDirty(bc * 8, atomic_load_explicit(&sBitsS, memory_order_relaxed), t, solidDirty);
+  sMarkDirty(bc * 8, atomic_load_explicit(&lBitsS, memory_order_relaxed), t, liquidDirty);
   if (t == 0u) wakeAppend(ctr, wake, bc);           // the physics looks at it next step
   if (!(be & W_UNI)) { if (packed != old) bricks[ulong(be) * 128ul + t] = packed; return; }
   if (t == 0u) { idxS = alloc(ctr, C_BBUMP, C_BFREE, C_BCAP, brickFree); if (idxS != W_NONE) tables[te] = idxS; }
@@ -514,6 +531,7 @@ kernel void w_editBricks(device uint* grid [[buffer(0)]], device uint* tables [[
 
 // Smooth surfaces (contract, mesher, liquids) and drawing: each in its own header, one translation unit.
 #include "Surface.h"
+#include "SurfaceJobs.h"
 #include "Mesh.h"
 #include "Liquid.h"
 #include "Render.h"
@@ -669,10 +687,12 @@ kernel void w_move(device const uint* grid [[buffer(0)]], device const uint* tab
                    device atomic_int* ctr [[buffer(3)]], device const uint* L [[buffer(4)]], device uint* next [[buffer(5)]],
                    device uint* fresh [[buffer(6)]], device atomic_uint* bitsNext [[buffer(7)]], device const uint* bitsCur [[buffer(8)]],
                    constant MoveParams& P [[buffer(9)]], device uchar* wetFlag [[buffer(10)]],
+                   device atomic_uint* solidDirty [[buffer(15)]], device atomic_uint* liquidDirty [[buffer(16)]],
                    uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
   threadgroup ulong base[8];          // where the brick and its forward neighbours start in the pool (~0: no storage)
   threadgroup atomic_uint wakeMask;   // bit (ox+1) + 3(oz+1) + 9(oy+1): the brick at that offset wakes next step
   threadgroup atomic_uint sawWater;   // any liquid among the cells this group read: the liquid pass looks at it
+  threadgroup atomic_uint sBitsS, lBitsS;   // the changed cells per axis (sAxisBits): solids changed, anything changed
   if (tg >= min(uint(atomic_load_explicit(&ctr[P.cur], memory_order_relaxed)), W_MAXL)) return;
   int3 b = unpackB(L[tg]);
   if (t < 8u) {
@@ -684,7 +704,10 @@ kernel void w_move(device const uint* grid [[buffer(0)]], device const uint* tab
     }
     base[t] = a;
   }
-  if (t == 0u) { atomic_store_explicit(&wakeMask, 0u, memory_order_relaxed); atomic_store_explicit(&sawWater, 0u, memory_order_relaxed); }
+  if (t == 0u) {
+    atomic_store_explicit(&wakeMask, 0u, memory_order_relaxed); atomic_store_explicit(&sawWater, 0u, memory_order_relaxed);
+    atomic_store_explicit(&sBitsS, 0u, memory_order_relaxed); atomic_store_explicit(&lBitsS, 0u, memory_order_relaxed);
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   int3 lo = b * 8 + int(P.parity) + 2 * int3(t & 3u, t >> 4, (t >> 2) & 3u);
   ulong addr[8];
@@ -701,7 +724,7 @@ kernel void w_move(device const uint* grid [[buffer(0)]], device const uint* tab
   for (uint i = 0; i < 8u; i++) wet |= isLiquid(old[i]);
   if (wet) atomic_store_explicit(&sawWater, 1u, memory_order_relaxed);
   if (stepBlock(c, hash3(lo.x, lo.y, lo.z, P.step))) {
-    uint mask = 0;
+    uint mask = 0, sb = 0, lb = 0;
     for (uint i = 0; i < 8u; i++) {
       if (c[i] == old[i]) continue;
       bricks[addr[i]] = uchar(c[i]);
@@ -710,10 +733,17 @@ kernel void w_move(device const uint* grid [[buffer(0)]], device const uint* tab
       int3 o0 = ((w - 1) >> 3) - b, o1 = ((w + 1) >> 3) - b;
       for (int oy = o0.y; oy <= o1.y; oy++) for (int oz = o0.z; oz <= o1.z; oz++) for (int ox = o0.x; ox <= o1.x; ox++)
         mask |= 1u << uint((ox + 1) + 3 * (oz + 1) + 9 * (oy + 1));
+      uint ab = sAxisBits(w - b * 8);
+      lb |= ab;
+      if (solid(c[i]) || solid(old[i])) sb |= ab;   // liquid and air trading places leave the solid mesh as it is
     }
     atomic_fetch_or_explicit(&wakeMask, mask, memory_order_relaxed);
+    atomic_fetch_or_explicit(&lBitsS, lb, memory_order_relaxed);
+    if (sb) atomic_fetch_or_explicit(&sBitsS, sb, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  sMarkDirty(b * 8, atomic_load_explicit(&sBitsS, memory_order_relaxed), t, solidDirty);
+  sMarkDirty(b * 8, atomic_load_explicit(&lBitsS, memory_order_relaxed), t, liquidDirty);
   if (t == 0u) wetFlag[tg] = uchar(atomic_load_explicit(&sawWater, memory_order_relaxed));
   if (t < 27u && (atomic_load_explicit(&wakeMask, memory_order_relaxed) >> t) & 1u) {
     int3 n = b + int3(int(t % 3u), int(t / 9u), int((t / 3u) % 3u)) - 1;
@@ -966,8 +996,9 @@ kernel void w_waterApply(device const uint* grid [[buffer(0)]], device const uin
                          device uint* fresh [[buffer(6)]], device atomic_uint* bitsNext [[buffer(7)]], device const uint* bitsCur [[buffer(8)]],
                          device const uint* slots [[buffer(9)]], device const Edge* edges [[buffer(10)]],
                          constant WaterParams& P [[buffer(12)]], device const uint* stamps [[buffer(14)]],
+                         device atomic_uint* liquidDirty [[buffer(16)]],
                          uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
-  threadgroup atomic_uint wakeMask;
+  threadgroup atomic_uint wakeMask, lBitsS;   // lBitsS: the changed cells per axis (sAxisBits)
   if (tg >= min(uint(atomic_load_explicit(&ctr[P.cur], memory_order_relaxed)), W_MAXL)) return;
   int3 b = unpackB(L[tg]);
   // the slots that hold this brick's edges: its own (+x, +z) and those of its -x and -z neighbours, if written now
@@ -978,7 +1009,7 @@ kernel void w_waterApply(device const uint* grid [[buffer(0)]], device const uin
   if (!s0 && !sx && !sz) return;
   ulong base = brickBase(b, grid, tables);
   if (base == ~0ul) return;
-  if (t == 0u) atomic_store_explicit(&wakeMask, 0u, memory_order_relaxed);
+  if (t == 0u) { atomic_store_explicit(&wakeMask, 0u, memory_order_relaxed); atomic_store_explicit(&lBitsS, 0u, memory_order_relaxed); }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   int x = int(t & 7u), z = int(t >> 3);
   // what leaves through the four edges, and what arrives (units and liquid) through each
@@ -1011,8 +1042,12 @@ kernel void w_waterApply(device const uint* grid [[buffer(0)]], device const uin
     int3 o0 = int3(x == 0 ? -1 : 0, y0 <= 0 ? -1 : 0, z == 0 ? -1 : 0), o1 = int3(x == 7 ? 1 : 0, y1 >= 7 ? 1 : 0, z == 7 ? 1 : 0);
     for (int oy = o0.y; oy <= o1.y; oy++) for (int oz = o0.z; oz <= o1.z; oz++) for (int ox = o0.x; ox <= o1.x; ox++)
       mask |= 1u << uint((ox + 1) + 3 * (oz + 1) + 9 * (oy + 1));
+    // the cells this column changed lie in y0..y1 (one cell more at worst)
+    uint ya = uint(clamp(y0, 0, 7)), yb = uint(clamp(y1, 0, 7));
+    atomic_fetch_or_explicit(&lBitsS, sAxisBits(int3(x, 0, z)) | (((2u << yb) - (1u << ya)) << 10), memory_order_relaxed);
   }
   if (mask) atomic_fetch_or_explicit(&wakeMask, mask, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   wakeInsert(atomic_load_explicit(&wakeMask, memory_order_relaxed), t, b, bitsNext, bitsCur, ctr, P.next, next, fresh);
+  sMarkDirty(b * 8, atomic_load_explicit(&lBitsS, memory_order_relaxed), t, liquidDirty);
 }
