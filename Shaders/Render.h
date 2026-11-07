@@ -195,7 +195,11 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
     r.max_distance = min(tS, tLim);
     float tL = 1e30f; float3 ln = float3(0, 1, 0); uint lk = WATER;
     auto ql = SI.liquids ? X.intersect(r, tlas, S_MASK_LIQUID) : decltype(X.intersect(r, tlas, S_MASK_LIQUID))();
-    if (SI.liquids && ql.type == raytracing::intersection_type::triangle) {
+    // a slot's surface counts only while its mc is liquid-covered (between a change and its refit it is stale, and the
+    // walk draws that mc's liquid): the mc of the liquid cell just under the hit
+    bool lHit = SI.liquids && ql.type == raytracing::intersection_type::triangle;
+    if (lHit) { int3 lc = int3(floor(o + d * ql.distance - float3(0, 0.5f, 0))); lHit = inWorld(lc) && bitSet(lcover, mcIdx(lc >> 5)); }
+    if (lHit) {
       uint slot = ql.user_instance_id, pid = ql.primitive_id, col = pid >> 1;
       uint v = slot * uint(L_VERTS) + (col >> 5) * 33u + (col & 31u);
       float3 v0 = float3(lverts[v]), v1 = float3(lverts[v + ((pid & 1u) ? 34u : 33u)]), v2 = float3(lverts[v + ((pid & 1u) ? 1u : 34u)]);
