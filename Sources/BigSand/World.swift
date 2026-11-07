@@ -316,6 +316,7 @@ final class World {
     let e = cb.makeComputeCommandEncoder()!
     e.setBuffer(grid, offset: 0, index: 0); e.setBuffer(tables.buffer, offset: 0, index: 1)
     e.setBuffer(ctr, offset: 0, index: 3); e.setBytes(&E, length: MemoryLayout<WEdit>.stride, index: 5)
+    e.setBuffer(surfaces.solidDirty, offset: 0, index: 15); e.setBuffer(surfaces.liquidDirty, offset: 0, index: 16)   // w_editBricks' dirty marks
     func fix() { e.setComputePipelineState(pFixFree); e.setBuffer(ctr, offset: 0, index: 0); e.dispatchThreads(one, threadsPerThreadgroup: one)
                  e.setBuffer(grid, offset: 0, index: 0) }
     e.setComputePipelineState(pEditChunks)
@@ -352,6 +353,8 @@ final class World {
     let curCount = (cur == 0 ? C.list0 : C.list1).rawValue, nextCount = (nxt == 0 ? C.list0 : C.list1).rawValue
     let one = MTLSize(width: 1, height: 1, depth: 1), none = UInt32.max
     let e = cb.makeComputeCommandEncoder()!
+    // the surfaces' dirty bits, for w_move and w_waterApply (no other kernel here binds 15 or 16)
+    e.setBuffer(surfaces.solidDirty, offset: 0, index: 15); e.setBuffer(surfaces.liquidDirty, offset: 0, index: 16)
     func args(_ count: Int, per: Int, arg: C, cap: UInt32, zero: [Int] = []) {
       var z = SIMD4<UInt32>(repeating: none)
       for (i, v) in zero.enumerated() { z[i] = UInt32(v) }
