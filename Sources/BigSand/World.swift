@@ -62,13 +62,14 @@ final class SparsePool {
 /// boxes collapsed at every level (see Shaders/World.metal). Generated on the GPU as an island; drawn by rays;
 /// edited by spheres whose cost follows the sphere, not the world.
 final class World {
-  // material ids (Shaders/World.metal)
-  static let AIR: UInt32 = 0, ROCK: UInt32 = 1, SAND: UInt32 = 2, WATER: UInt32 = 3, PLANT: UInt32 = 4
-  static let SNOW: UInt32 = 5, STONE: UInt32 = 6, BASALT: UInt32 = 7, WALL: UInt32 = 8
-  static let names = ["air", "rock", "sand", "water", "plant", "snow", "stone", "basalt", "wall",
+  // material ids (Shaders/World.metal); the liquids come last
+  static let AIR: UInt32 = 0, ROCK: UInt32 = 1, SAND: UInt32 = 2, PLANT: UInt32 = 3, SNOW: UInt32 = 4
+  static let STONE: UInt32 = 5, BASALT: UInt32 = 6, WALL: UInt32 = 7, WATER: UInt32 = 29
+  static let names = ["air", "rock", "sand", "plant", "snow", "stone", "basalt", "wall",
                       "clay", "dust", "ash", "sawdust", "salt", "broken glass", "scrap metal", "brick rubble",
                       "gold nuggets", "crystal dust", "broken coal",
-                      "wood", "planks", "metal", "brick", "coal", "sandstone", "limestone", "titanium", "tungsten", "gold"]
+                      "wood", "planks", "metal", "brick", "coal", "sandstone", "limestone", "titanium", "tungsten", "gold",
+                      "water", "salt water", "oil", "mercury", "mud", "slime", "blood", "toxic sludge"]
   static let sea = 192
 
   // counters (Shaders/World.metal, C_*)
@@ -92,7 +93,7 @@ final class World {
   let tables, bricks: SparsePool
   /// One flow slot index per table entry (0: none), the same layout as `tables`.
   let slots: SparsePool
-  /// Water per column of a brick with flowing water: its +x/+z edges' flow and units crossing (8 bytes); the
+  /// Liquid per column of a brick with flowing liquid: its +x/+z edges' flow and what crosses them (8 bytes); the
   /// sub-step each slot was last written in; the slots' free stack.
   let flows, stamps, flowFree: MTLBuffer
   private var waterStamp: UInt32 = 0
