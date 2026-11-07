@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
   name: "BigSand",
-  platforms: [.macOS(.v15)],
+  platforms: [.macOS("26.0")],
   targets: [
     .executableTarget(name: "BigSand", path: "Sources/BigSand",
                       swiftSettings: [.unsafeFlags(["-Ounchecked"])])
