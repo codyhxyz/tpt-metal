@@ -646,7 +646,7 @@ fragment float4 w_presentF(WVOut in [[stage_in]], texture2d<float> tex [[texture
 enum : uint { ST_STATIC = 0, ST_GAS = 1, ST_POWDER = 2, ST_LIQUID = 3 };
 //                                    air       rock       sand       water      plant      snow       stone      basalt     wall
 constant uchar MAT_STATE[NMAT] = { ST_GAS, ST_STATIC, ST_POWDER, ST_LIQUID, ST_STATIC, ST_POWDER, ST_POWDER, ST_STATIC, ST_STATIC };
-constant uchar MAT_DENS[NMAT]  = { 1,      255,       16,        10,        255,       5,         25,        255,       255 };
+constant uchar MAT_DENS[NMAT]  = { 1,      255,       16,        10,        255,       9,         26,        255,       255 };   // elements.js dens
 
 inline bool movable(uint m) { return MAT_STATE[matOf(m)] != ST_STATIC; }
 inline bool sinksInto(uint a, uint b) { return movable(a) && movable(b) && MAT_DENS[matOf(a)] > MAT_DENS[matOf(b)]; }   // a above b swaps
@@ -851,31 +851,32 @@ kernel void w_wake(device const uint* wake [[buffer(0)]], device atomic_int* ctr
 //   force     moving one unit (1/128 cell) from a surface at h1 to one at h2 releases energy only if h1 - h2 is more
 //             than one unit, so the push is the head difference less one unit (in units), and water rests flat to
 //             one unit (2.3 mm)
-//   gravity   G = g dt^2 / dx (cells per step per step), times the water's depth: waves run at sqrt(g depth)
+//   gravity   G = g dt^2 / dx (cells per step per step) times the water's depth: waves run at sqrt(g depth)
 //   friction  Manning's law for a natural bed (n = 0.03 s m^-1/3): deceleration g n^2 |u| u / depth^(4/3), applied
 //             implicitly (unconditionally stable)
-//   stability flow is turned into water every fourth step on each edge (below), so the depth that sets the wave
-//             speed is capped where G depth = 1/16 (a wave crosses less than a quarter of a column per step)
+//   time step the CPU splits a physics step into as many water sub-steps as keep a wave under one column per
+//             sub-step in 2D (the explicit scheme's stability limit)
 //
 // A column is one of a brick's 64 columns of 8 cells. Its head is its surface in units from the brick's floor: the
 // top of its highest non-air cell (a water cell counts its units). It is wet if that cell is water with air above.
-// It owns the flow across its +x and +z edges and the part of a unit built up there, as half floats (8 bytes per
-// column, in a per-brick flow slot held while the brick is awake).
+// It owns the edges on its +x and +z sides: their flow (half float) and the whole units crossing them this sub-step
+// (signed, positive toward +x / +z), 8 bytes per column, in a per-brick flow slot held while the brick is awake.
 //
-// A step, per awake brick, one thread per column:
-//   1. heads: one read of the column's 8 cells
-//   2. flows on the column's +x and +z edges: push, gravity, friction; no flow out of a dry column or into a full one
-//   3. transfer: on this step's pairs of columns (x pairs of even columns, then odd, then z pairs; every column is in
-//      exactly one pair, and the pair's lower column does it), the whole units built up move from the top of one
-//      column to the top of the other: no more than the giver holds on top or the taker has room for. One thread
-//      writes a pair's cells, so water is conserved exactly, in units, with no atomics.
-//   4. rest: an edge whose push is zero and whose flow and build-up are under one unit is at rest (no unit will ever
-//      cross it); a brick with nothing flowing sleeps.
+// A sub-step is two passes over the awake bricks, one thread per column:
+//   flow   each column updates its two edges from both sides' heads, and sets the units crossing them: no more than
+//          a quarter of what the giver has on top or of the room the taker has (a column has four edges, so it can
+//          never give more than it holds or take more than fits). Units cross only into a brick that is also in this
+//          step's list (else it is woken for the next step). The slot is stamped with the sub-step.
+//   apply  each column takes what leaves through its own edges and adds what its -x and -z neighbours send it (read
+//          only from slots stamped this sub-step), and writes only its own cells. Water is conserved exactly, in
+//          units, with no atomics.
+// An edge with no push and less than a unit of flow is at rest; a brick with nothing flowing sleeps.
 
 #define W_MANNING 0.03f       // Manning roughness of a natural bed, s m^-1/3
 #define W_CELL_M 0.3f         // metres per cell
 
-struct WaterParams { uint cur, phase, next, pad; float G, dt, pad1, pad2; };
+struct WaterParams { uint cur, stamp, next, pad; float G, dt, pad1, pad2; };
+struct Edge { half2 q; short2 a; };   // flow on the +x and +z edges, and the units crossing them this sub-step
 
 // One column's 8 cells (y = 0..7): its head in units, whether it is wet, the water stacked on its top (units).
 struct Col { int head; bool wet; int avail; };
@@ -910,112 +911,106 @@ inline void putUnits(device uchar* bricks, ulong base, int x, int z, int head, i
   }
 }
 
-kernel void w_water(device const uint* grid [[buffer(0)]], device const uint* tables [[buffer(1)]], device uchar* bricks [[buffer(2)]],
-                    device atomic_int* ctr [[buffer(3)]], device const uint* L [[buffer(4)]], device uint* next [[buffer(5)]],
-                    device uint* fresh [[buffer(6)]], device atomic_uint* bitsNext [[buffer(7)]], device const uint* bitsCur [[buffer(8)]],
-                    device uint* slots [[buffer(9)]], device half4* flows [[buffer(10)]], device const uint* flowFree [[buffer(11)]],
-                    constant WaterParams& P [[buffer(12)]], device const uchar* wetFlag [[buffer(13)]],
-                    uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
-  threadgroup ulong base[8];          // the brick and its +x/+y/+z neighbours in the pool (~0: no storage)
+// The brick's storage and that of its +x/+y/+z neighbours (~0: none); t < 8 computes entry t.
+inline ulong brickBase(int3 n, device const uint* grid, device const uint* tables) {
+  if (!brickInWorld(n)) return ~0ul;
+  uint ce = grid[chunkIdx(n >> 3)];
+  if (ce & W_UNI) return ~0ul;
+  uint be = tables[ulong(ce) * 512ul + loc(n & 7)];
+  return (be & W_UNI) ? ~0ul : ulong(be) * 512ul;
+}
+inline uint slotOf(int3 n, device const uint* grid, device const uint* slots) {   // flow slot + 1, or 0
+  if (!brickInWorld(n)) return 0u;
+  uint ce = grid[chunkIdx(n >> 3)];
+  return (ce & W_UNI) ? 0u : slots[ulong(ce) * 512ul + loc(n & 7)];
+}
+inline uint aboveCell(int3 w, device const uint* grid, device const uint* tables, device const uchar* bricks) {
+  return inWorld(w) ? cellAt(w, grid, tables, bricks) : uint(AIR);
+}
+inline void wakeInsert(uint mask, uint t, int3 b, device atomic_uint* bitsNext, device const uint* bitsCur, device atomic_int* ctr,
+                       uint nextCount, device uint* next, device uint* fresh) {
+  if (t < 27u && (mask >> t) & 1u) {
+    int3 n = b + int3(int(t % 3u), int(t / 9u), int((t / 3u) % 3u)) - 1;
+    if (brickInWorld(n)) insertNext(n, bitsNext, bitsCur, ctr, int(nextCount), next, fresh);
+  }
+}
+
+// Pass 1: each column's +x and +z edges.
+kernel void w_waterFlow(device const uint* grid [[buffer(0)]], device const uint* tables [[buffer(1)]], device const uchar* bricks [[buffer(2)]],
+                        device atomic_int* ctr [[buffer(3)]], device const uint* L [[buffer(4)]], device uint* next [[buffer(5)]],
+                        device uint* fresh [[buffer(6)]], device atomic_uint* bitsNext [[buffer(7)]], device const uint* bitsCur [[buffer(8)]],
+                        device uint* slots [[buffer(9)]], device Edge* edges [[buffer(10)]], device const uint* flowFree [[buffer(11)]],
+                        constant WaterParams& P [[buffer(12)]], device const uchar* wetFlag [[buffer(13)]], device uint* stamps [[buffer(14)]],
+                        uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  threadgroup ulong base[8];
   threadgroup short headS[64], availS[64];
   threadgroup bool wetS[64];
   threadgroup uint slotS;
-  threadgroup bool newSlot;
+  threadgroup bool newSlot, sendX, sendZ;
   threadgroup atomic_uint anyWet, wakeMask;
   if (tg >= min(uint(atomic_load_explicit(&ctr[P.cur], memory_order_relaxed)), W_MAXL)) return;
   int3 b = unpackB(L[tg]);
   uint ce0 = grid[chunkIdx(b >> 3)];
+  if (ce0 & W_UNI) return;
   ulong se = ulong(ce0) * 512ul + loc(b & 7);
-  // a brick the move pass saw no water in, and that has no flow left, has nothing to do
-  if (!wetFlag[tg] && ((ce0 & W_UNI) || slots[se] == 0u)) return;
-  if (t < 8u) {
-    int3 n = b + int3(t & 1u, t >> 2, (t >> 1) & 1u);
-    ulong a = ~0ul;
-    if (brickInWorld(n)) {
-      uint ce = grid[chunkIdx(n >> 3)];
-      if (!(ce & W_UNI)) { uint be = tables[ulong(ce) * 512ul + loc(n & 7)]; if (!(be & W_UNI)) a = ulong(be) * 512ul; }
-    }
-    base[t] = a;
+  // nothing to do unless this brick holds water, still flows, or a +x/+z neighbour does (this brick owns the edge between)
+  if (!wetFlag[tg] && slots[se] == 0u && slotOf(b + int3(1, 0, 0), grid, slots) == 0u && slotOf(b + int3(0, 0, 1), grid, slots) == 0u) return;
+  if (t < 8u) base[t] = brickBase(b + int3(t & 1u, t >> 2, (t >> 1) & 1u), grid, tables);
+  if (t == 0u) {
+    atomic_store_explicit(&anyWet, 0u, memory_order_relaxed); atomic_store_explicit(&wakeMask, 0u, memory_order_relaxed);
+    int3 bx = b + int3(1, 0, 0), bz = b + int3(0, 0, 1);
+    uint ix = bitOf(bx), iz = bitOf(bz);
+    sendX = brickInWorld(bx) && ((bitsCur[ix >> 5] >> (ix & 31u)) & 1u);    // the +x brick applies this sub-step too
+    sendZ = brickInWorld(bz) && ((bitsCur[iz >> 5] >> (iz & 31u)) & 1u);
   }
-  if (t == 0u) { atomic_store_explicit(&anyWet, 0u, memory_order_relaxed); atomic_store_explicit(&wakeMask, 0u, memory_order_relaxed); }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (base[0] == ~0ul) return;
   int x = int(t & 7u), z = int(t >> 3);
-  uint above = base[4] != ~0ul ? uint(bricks[base[4] + loc(int3(x, 0, z))])
-                               : (brickInWorld(b + int3(0, 1, 0)) ? cellAt(b * 8 + int3(x, 8, z), grid, tables, bricks) : uint(AIR));
-  Col me = column(bricks, base[0], x, z, above);
+  Col me = column(bricks, base[0], x, z, base[4] != ~0ul ? uint(bricks[base[4] + loc(int3(x, 0, z))]) : aboveCell(b * 8 + int3(x, 8, z), grid, tables, bricks));
   headS[t] = short(me.head); availS[t] = short(me.avail); wetS[t] = me.wet;
   if (me.wet) atomic_store_explicit(&anyWet, 1u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // the brick's flow slot: a brick with a free surface gets one; a dry brick without one has nothing to do
   if (t == 0u) {
     uint sl = slots[se];
     newSlot = false;
-    if (sl == 0u && atomic_load_explicit(&anyWet, memory_order_relaxed)) {
+    if (sl == 0u) {
       uint f = alloc(ctr, C_FBUMP, C_FFREE, C_FCAP, flowFree);
       if (f != W_NONE) { sl = f + 1u; slots[se] = sl; newSlot = true; }
     }
     slotS = sl;
+    if (sl) stamps[sl - 1u] = P.stamp;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (slotS == 0u) return;
-  device half4* F = flows + ulong(slotS - 1u) * 64ul;
-  half4 f = newSlot ? half4(0) : F[t];              // x flow, x built up, z flow, z built up (units; a new slot is at rest)
-  // the +x and +z neighbour columns (in the next brick at the edge)
-  Col nx, nz;
-  if (x < 7) { nx.head = headS[t + 1]; nx.wet = wetS[t + 1]; nx.avail = availS[t + 1]; }
-  else {
-    uint ab = brickInWorld(b + int3(1, 1, 0)) ? cellAt(b * 8 + int3(8, 8, z), grid, tables, bricks) : uint(AIR);
-    nx = column(bricks, base[1], 0, z, ab);
-  }
-  if (z < 7) { nz.head = headS[t + 8]; nz.wet = wetS[t + 8]; nz.avail = availS[t + 8]; }
-  else {
-    uint ab = brickInWorld(b + int3(0, 1, 1)) ? cellAt(b * 8 + int3(x, 8, 8), grid, tables, bricks) : uint(AIR);
-    nz = column(bricks, base[2], x, 0, ab);
-  }
-  float maxDepth = 1.0f / (16.0f * P.G);            // cells: the stability cap on the depth that sets the wave speed
+  device Edge* E = edges + ulong(slotS - 1u) * 64ul;
+  Edge ed = newSlot ? Edge{ half2(0), short2(0) } : E[t];
+  Col nb[2];
+  if (x < 7) { nb[0].head = headS[t + 1]; nb[0].wet = wetS[t + 1]; nb[0].avail = availS[t + 1]; }
+  else nb[0] = column(bricks, base[1], 0, z, aboveCell(b * 8 + int3(8, 8, z), grid, tables, bricks));
+  if (z < 7) { nb[1].head = headS[t + 8]; nb[1].wet = wetS[t + 8]; nb[1].avail = availS[t + 8]; }
+  else nb[1] = column(bricks, base[2], x, 0, aboveCell(b * 8 + int3(x, 8, 8), grid, tables, bricks));
+  bool send[2] = { x < 7 || sendX, z < 7 || sendZ };
   uint mask = 0;
-  float fl[2] = { float(f.x), float(f.z) }, acc[2] = { float(f.y), float(f.w) };
-  Col nb[2] = { nx, nz };
+  float qs[2] = { float(ed.q.x), float(ed.q.y) };
+  int as[2] = { 0, 0 };
   for (int e = 0; e < 2; e++) {
     int dh = me.head - nb[e].head;
     int push = (dh > 0 ? 1 : (dh < 0 ? -1 : 0)) * max(abs(dh) - 1, 0);
-    // the water carrying the flow: both sides' depth where wet (cells), capped for stability
-    float depth = clamp(float(max(me.wet ? me.avail : 0, nb[e].wet ? nb[e].avail : 0)) / 128.0f, 1.0f / 128.0f, maxDepth);
-    float q = fl[e] + P.G * depth * float(push);
-    // friction: u = flow speed (m/s); q /= 1 + dt g n^2 |u| / depth^(4/3)
-    float u = abs(q) / 128.0f / depth * W_CELL_M / P.dt;
-    float dm = depth * W_CELL_M;
+    float depth = max(float(max(me.wet ? me.avail : 0, nb[e].wet ? nb[e].avail : 0)) / 128.0f, 1.0f / 128.0f);   // cells
+    float q = qs[e] + P.G * depth * float(push);
+    float u = abs(q) / 128.0f / depth * W_CELL_M / P.dt, dm = depth * W_CELL_M;   // flow speed (m/s), depth (m)
     q /= 1.0f + P.dt * 9.8f * W_MANNING * W_MANNING * u / pow(dm, 4.0f / 3.0f);
     if ((q > 0 && (!me.wet || nb[e].head >= 1024)) || (q < 0 && (!nb[e].wet || me.head >= 1024))) q = 0;
-    float a = acc[e] + q;
-    if (push == 0 && abs(q) < 1.0f && abs(a) < 1.0f) { q = 0; a = 0; }   // no unit will ever cross: at rest
-    fl[e] = q; acc[e] = a;
-    if (q != 0) mask |= 1u << 13;                   // still flowing: this brick stays awake
+    if (push == 0 && abs(q) < 1.0f) q = 0;                                    // no unit will ever cross: at rest
+    int a = int(q);                                                           // whole units, toward the slower side
+    if (a > 0) a = min(a, min(me.avail / 4, (1024 - nb[e].head) / 4));
+    if (a < 0) a = -min(-a, min(nb[e].avail / 4, (1024 - me.head) / 4));
+    if (!send[e]) { a = 0; if (q != 0) mask |= 1u << (e == 0 ? 14 : 16); }     // the other brick isn't running: wake it
+    qs[e] = q; as[e] = a;
+    if (q != 0) mask |= 1u << 13;
+    if (q != 0 && (e == 0 ? x == 7 : z == 7)) mask |= 1u << (e == 0 ? 14 : 16);
   }
-  // this step's pair: phase 0/1 = x edges of even/odd columns, 2/3 = z edges of even/odd rows
-  int e = int(P.phase >> 1);
-  int mine = e == 0 ? x : z;
-  if ((mine & 1) == int(P.phase & 1u) && abs(acc[e]) >= 1.0f) {
-    bool out = acc[e] > 0;
-    Col giver = out ? me : nb[e], taker = out ? nb[e] : me;
-    int k = min(int(abs(acc[e])), min(giver.avail, 1024 - taker.head));
-    if (k > 0) {
-      bool edgeBrick = mine == 7;
-      ulong otherBase = edgeBrick ? base[e == 0 ? 1 : 2] : base[0];
-      int2 mc = int2(x, z), oc = e == 0 ? int2(edgeBrick ? 0 : x + 1, z) : int2(x, edgeBrick ? 0 : z + 1);
-      ulong gb = out ? base[0] : otherBase, tb = out ? otherBase : base[0];
-      int2 gc = out ? mc : oc, tc = out ? oc : mc;
-      takeUnits(bricks, gb, gc.x, gc.y, giver.head, k);
-      putUnits(bricks, tb, tc.x, tc.y, taker.head, k);
-      acc[e] -= out ? float(k) : -float(k);
-      mask |= 1u << 13;
-      if (edgeBrick) mask |= 1u << (e == 0 ? 14 : 16);
-    }
-  }
-  if (fl[0] != 0 && x == 7) mask |= 1u << 14;
-  if (fl[1] != 0 && z == 7) mask |= 1u << 16;
-  F[t] = half4(half(fl[0]), half(acc[0]), half(fl[1]), half(acc[1]));
+  E[t] = Edge{ half2(half(qs[0]), half(qs[1])), short2(short(as[0]), short(as[1])) };
   // a wet column next to air across the brick's -x or -z side wakes that brick, which owns the edge between them
   if (me.wet) {
     int y = (me.head - 1) >> 7;
@@ -1024,8 +1019,48 @@ kernel void w_water(device const uint* grid [[buffer(0)]], device const uint* ta
   }
   if (mask) atomic_fetch_or_explicit(&wakeMask, mask, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t < 27u && (atomic_load_explicit(&wakeMask, memory_order_relaxed) >> t) & 1u) {
-    int3 n = b + int3(int(t % 3u), int(t / 9u), int((t / 3u) % 3u)) - 1;
-    if (brickInWorld(n)) insertNext(n, bitsNext, bitsCur, ctr, int(P.next), next, fresh);
+  wakeInsert(atomic_load_explicit(&wakeMask, memory_order_relaxed), t, b, bitsNext, bitsCur, ctr, P.next, next, fresh);
+}
+
+// Pass 2: each column applies what crosses its four edges, writing only its own cells.
+kernel void w_waterApply(device const uint* grid [[buffer(0)]], device const uint* tables [[buffer(1)]], device uchar* bricks [[buffer(2)]],
+                         device atomic_int* ctr [[buffer(3)]], device const uint* L [[buffer(4)]], device uint* next [[buffer(5)]],
+                         device uint* fresh [[buffer(6)]], device atomic_uint* bitsNext [[buffer(7)]], device const uint* bitsCur [[buffer(8)]],
+                         device const uint* slots [[buffer(9)]], device const Edge* edges [[buffer(10)]],
+                         constant WaterParams& P [[buffer(12)]], device const uint* stamps [[buffer(14)]],
+                         uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  threadgroup atomic_uint wakeMask;
+  if (tg >= min(uint(atomic_load_explicit(&ctr[P.cur], memory_order_relaxed)), W_MAXL)) return;
+  int3 b = unpackB(L[tg]);
+  // the slots that hold this brick's edges: its own (+x, +z) and those of its -x and -z neighbours, if written now
+  uint s0 = slotOf(b, grid, slots), sx = slotOf(b - int3(1, 0, 0), grid, slots), sz = slotOf(b - int3(0, 0, 1), grid, slots);
+  if (s0 && stamps[s0 - 1u] != P.stamp) s0 = 0;
+  if (sx && stamps[sx - 1u] != P.stamp) sx = 0;
+  if (sz && stamps[sz - 1u] != P.stamp) sz = 0;
+  if (!s0 && !sx && !sz) return;
+  ulong base = brickBase(b, grid, tables);
+  if (base == ~0ul) return;
+  if (t == 0u) atomic_store_explicit(&wakeMask, 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  int x = int(t & 7u), z = int(t >> 3);
+  int net = 0;                                                         // units this column gains
+  if (s0) { Edge e = edges[ulong(s0 - 1u) * 64ul + t]; net -= int(e.a.x) + int(e.a.y); }
+  if (x > 0) { if (s0) net += int(edges[ulong(s0 - 1u) * 64ul + t - 1u].a.x); }
+  else if (sx) net += int(edges[ulong(sx - 1u) * 64ul + uint(z * 8 + 7)].a.x);
+  if (z > 0) { if (s0) net += int(edges[ulong(s0 - 1u) * 64ul + t - 8u].a.y); }
+  else if (sz) net += int(edges[ulong(sz - 1u) * 64ul + uint(56 + x)].a.y);
+  uint mask = 0;
+  if (net != 0) {
+    Col c = column(bricks, base, x, z, aboveCell(b * 8 + int3(x, 8, z), grid, tables, bricks));
+    if (net < 0) takeUnits(bricks, base, x, z, c.head, -net);
+    else putUnits(bricks, base, x, z, c.head, net);
+    // wake the bricks next to the cells that changed
+    int y0 = (min(c.head, c.head + net) - 1) >> 7, y1 = (max(c.head, c.head + net) - 1) >> 7;
+    int3 o0 = int3(x == 0 ? -1 : 0, y0 <= 0 ? -1 : 0, z == 0 ? -1 : 0), o1 = int3(x == 7 ? 1 : 0, y1 >= 7 ? 1 : 0, z == 7 ? 1 : 0);
+    for (int oy = o0.y; oy <= o1.y; oy++) for (int oz = o0.z; oz <= o1.z; oz++) for (int ox = o0.x; ox <= o1.x; ox++)
+      mask |= 1u << uint((ox + 1) + 3 * (oz + 1) + 9 * (oy + 1));
   }
+  if (mask) atomic_fetch_or_explicit(&wakeMask, mask, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  wakeInsert(atomic_load_explicit(&wakeMask, memory_order_relaxed), t, b, bitsNext, bitsCur, ctr, P.next, next, fresh);
 }
