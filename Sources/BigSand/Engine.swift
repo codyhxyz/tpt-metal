@@ -23,9 +23,9 @@ final class Engine {
   var cells: Int { WX * WZ * WORDS * 64 }
 
   let device: MTLDevice, queue: MTLCommandQueue
-  let vox, HF, FV, air, countdown, awake, active, args, args2, tileBounds, superBounds, stepsOut, censusOut: MTLBuffer
+  let vox, HF, FV, air, countdown, awake, active, args, args2, args3, tileBounds, superBounds, superAir, sunMap, pileTop, stepsOut, censusOut: MTLBuffer
   let V: [MTLBuffer], Q: [MTLBuffer], changed: [MTLBuffer]
-  let pPlan, pFlowArgs, pFall, pFlow, pSurface, pSuper, pSeed, pCensus, pRender: MTLComputePipelineState
+  let pPlan, pFlowArgs, pFall, pFlow, pSurface, pSuper, pSun, pSeed, pCensus, pRender: MTLComputePipelineState
   let pPresent: MTLRenderPipelineState
   var cur = 0
   var tick: UInt32 = 0
@@ -40,7 +40,7 @@ final class Engine {
     let lib = try loadShaderLibrary(dev)
     func k(_ n: String) throws -> MTLComputePipelineState { try dev.makeComputePipelineState(function: lib.makeFunction(name: n)!) }
     pPlan = try k("plan"); pFlowArgs = try k("flowArgs"); pFall = try k("fall"); pFlow = try k("flow")
-    pSurface = try k("surface"); pSuper = try k("superBounds"); pSeed = try k("seed"); pCensus = try k("census"); pRender = try k("render")
+    pSurface = try k("surface"); pSuper = try k("superBounds"); pSun = try k("sunShadow"); pSeed = try k("seed"); pCensus = try k("census"); pRender = try k("render")
     let rp = MTLRenderPipelineDescriptor()
     rp.vertexFunction = lib.makeFunction(name: "presentV"); rp.fragmentFunction = lib.makeFunction(name: "presentF")
     rp.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
@@ -53,9 +53,10 @@ final class Engine {
     V = [buf(tiles * 4), buf(tiles * 4)]; Q = [buf(tiles * 8), buf(tiles * 8)]
     changed = [buf(tiles * 4), buf(tiles * 4)]
     air = buf(tiles * 8); countdown = buf(tiles * 4); awake = buf(tiles * 4); active = buf(tiles * 4)
-    args = buf(12, .storageModeShared); args2 = buf(12)
+    args = buf(12, .storageModeShared); args2 = buf(12); args3 = buf(12)
     let a = args.contents().bindMemory(to: UInt32.self, capacity: 3); a[0] = 0; a[1] = 1; a[2] = 1
-    tileBounds = buf(tiles * 8); superBounds = buf((4096 / 64) * (4096 / 64) * 8)
+    tileBounds = buf(tiles * 8); superBounds = buf((4096 / 64) * (4096 / 64) * 8); superAir = buf((4096 / 64) * (4096 / 64) * 8)
+    sunMap = buf(tiles * 4); pileTop = buf(4)
     stepsOut = buf(4, .storageModeShared); censusOut = buf(1024 * 4, .storageModeShared)
     reset()
   }
@@ -64,7 +65,7 @@ final class Engine {
   func reset() {
     let cb = queue.makeCommandBuffer()!
     let b = cb.makeBlitCommandEncoder()!
-    for buf in [vox, HF, FV, V[0], V[1], Q[0], Q[1], changed[0], changed[1], air, countdown, awake, tileBounds, superBounds] {
+    for buf in [vox, HF, FV, V[0], V[1], Q[0], Q[1], changed[0], changed[1], air, countdown, awake, tileBounds, superBounds, superAir, sunMap, pileTop] {
       b.fill(buffer: buf, range: 0..<buf.length, value: 0)
     }
     b.endEncoding()
@@ -85,6 +86,7 @@ final class Engine {
   private func encodeSuper(_ e: MTLComputeCommandEncoder) {
     e.setComputePipelineState(pSuper)
     e.setBuffer(tileBounds, offset: 0, index: 0); e.setBuffer(superBounds, offset: 0, index: 1)
+    e.setBuffer(air, offset: 0, index: 2); e.setBuffer(superAir, offset: 0, index: 3)
     e.dispatchThreads(MTLSize(width: SUPERS, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
   }
   private func perTile(_ e: MTLComputeCommandEncoder) {   // one 64-thread group per active tile (a thread per column)
@@ -105,7 +107,7 @@ final class Engine {
     e.setBuffer(args, offset: 0, index: 4); e.setBuffer(active, offset: 0, index: 5)
     e.dispatchThreads(MTLSize(width: TILES, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     e.setComputePipelineState(pFlowArgs)
-    e.setBuffer(args, offset: 0, index: 0); e.setBuffer(args2, offset: 0, index: 1)
+    e.setBuffer(args, offset: 0, index: 0); e.setBuffer(args2, offset: 0, index: 1); e.setBuffer(args3, offset: 0, index: 2)
     e.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
 
     // air -> pile (grains that land are added to their tile's count in V[0])
@@ -131,8 +133,12 @@ final class Engine {
     // its surface, and the rays' bounds
     e.setComputePipelineState(pSurface)
     e.setBuffer(V[0], offset: 0, index: 0); e.setBuffer(HF, offset: 0, index: 1); e.setBuffer(active, offset: 0, index: 2)
-    e.setBuffer(air, offset: 0, index: 3); e.setBuffer(tileBounds, offset: 0, index: 4)
+    e.setBuffer(air, offset: 0, index: 3); e.setBuffer(tileBounds, offset: 0, index: 4); e.setBuffer(pileTop, offset: 0, index: 5)
     perTile(e)
+    // the sun's height over the pile, only on ticks where something ran
+    e.setComputePipelineState(pSun)
+    e.setBuffer(V[0], offset: 0, index: 0); e.setBuffer(sunMap, offset: 0, index: 1); e.setBuffer(pileTop, offset: 0, index: 2)
+    e.dispatchThreadgroups(indirectBuffer: args3, indirectBufferOffset: 0, threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
     encodeSuper(e)
     e.endEncoding()
     cur = nxt; tick &+= 1
@@ -147,6 +153,7 @@ final class Engine {
     e.setComputePipelineState(pRender)
     e.setTexture(tex, index: 0); e.setTexture(depth, index: 1); e.setTexture(motion, index: 2)
     e.setBytes(&prev, length: MemoryLayout<Cam>.stride, index: 6)
+    e.setBuffer(sunMap, offset: 0, index: 7); e.setBuffer(air, offset: 0, index: 8); e.setBuffer(superAir, offset: 0, index: 9)
     e.setBuffer(vox, offset: 0, index: 0); e.setBuffer(HF, offset: 0, index: 1); e.setBuffer(tileBounds, offset: 0, index: 2)
     e.setBuffer(superBounds, offset: 0, index: 3); e.setBytes(&cam, length: MemoryLayout<Cam>.stride, index: 4)
     e.setBuffer(stepsOut, offset: 0, index: 5)
@@ -182,7 +189,7 @@ struct FlyCam {
   var forward: SIMD3<Float> { SIMD3(sin(yaw) * cos(pitch), sin(pitch), cos(yaw) * cos(pitch)) }
   func uniforms(aspect: Float, shadows: Bool, stats: Bool = false) -> Cam {
     let f = forward, r = simd_normalize(simd_cross(f, SIMD3<Float>(0, 1, 0))), u = simd_cross(r, f)
-    let sun = simd_normalize(SIMD3<Float>(-0.55, 0.70, -0.35))   // behind the default camera: the faces you see are lit
+    let sun = simd_normalize(SIMD3<Float>(-0.55, 0.70, -0.35))   // informational: the shaders use SUN_DIR in Shaders/BigSand.metal
     return Cam(pos: SIMD4(pos, 0), fwd: SIMD4(f, 0), right: SIMD4(r, 0), up: SIMD4(u, 0), sun: SIMD4(sun, 0),
                tanHalf: tan(fovY / 2), aspect: aspect, shadows: shadows ? 1 : 0, stats: stats ? 1 : 0)
   }

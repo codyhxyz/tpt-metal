@@ -58,66 +58,68 @@ kernel void plan(device const uint* changedLast [[buffer(0)]], device uint* chan
   if (c > 0) active[atomic_fetch_add_explicit(args, 1, memory_order_relaxed)] = t;
 }
 // One thread per active tile for the flow: threadgroups of 64.
-kernel void flowArgs(device const uint* args [[buffer(0)]], device uint* args2 [[buffer(1)]]) {
+// And the sun-height pass: all tiles, but only on ticks where any tile ran (a world at rest keeps last tick's map).
+kernel void flowArgs(device const uint* args [[buffer(0)]], device uint* args2 [[buffer(1)]], device uint* args3 [[buffer(2)]]) {
   args2[0] = (args[0] + 63u) / 64u; args2[1] = 1u; args2[2] = 1u;
+  args3[0] = args[0] > 0u ? (TX * TZ + 63u) / 64u : 0u; args3[1] = 1u; args3[2] = 1u;
 }
 
 // --- air: every airborne grain in a column falls with the column's speed. One shift moves the whole column;
 // grains that reach the pile's surface (or the floor) this tick join the pile's grain count.
+// Each thread streams its column up through two registers (this word, the next): every word is read once and
+// written only if it changed, and no on-chip memory is reserved, so a core keeps many groups in flight to hide
+// memory latency.
 kernel void fall(device ulong* vox [[buffer(0)]], device const uint* HF [[buffer(1)]], device float2* FV [[buffer(2)]],
                  device atomic_int* V [[buffer(3)]], device const uint* active [[buffer(4)]], device uint* changed [[buffer(5)]],
                  device uint2* air [[buffer(6)]],
                  uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
-  threadgroup ulong col[WORDS][64];
   threadgroup atomic_uint tgLo, tgHi, tgAny;
   threadgroup atomic_int tgLanded;
   uint tile = active[tg];
+  uint2 ae = air[tile];
+  if (ae.y <= ae.x) return;                  // nothing in the air over this tile (uniform for the whole group)
   int x = int(tile % TX) * 8 + int(lane & 7), z = int(tile / TX) * 8 + int(lane >> 3);
   if (lane == 0) {
     atomic_store_explicit(&tgLo, 0xffffffffu, memory_order_relaxed); atomic_store_explicit(&tgHi, 0u, memory_order_relaxed);
     atomic_store_explicit(&tgAny, 0u, memory_order_relaxed); atomic_store_explicit(&tgLanded, 0, memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint2 ae = air[tile];
-  if (ae.y > ae.x) {
-    // airborne sand of this tile lies in [ae.x, ae.y); one word below it receives what falls out of the lowest word
-    int w0 = max(0, int(ae.x >> 6) - 1), w1 = min(WORDS - 1, int((ae.y - 1u) >> 6));
-    uint ci = colIdx(x, z);
-    bool any = false;
-    for (int w = w0; w <= w1; w++) { ulong v = vox[addr(x, z, w)]; col[w][lane] = v; any = any || v != 0ul; }
-    float2 fv = FV[ci];
-    if (any) {
-      float v = min(fv.x + G, VMAX), s = fv.y + v;
-      int d = int(floor(s));
-      int cut = int(HF[ci]) + d;          // everything below this reaches the pile (or the floor) this tick
-      int landed = 0;
-      for (int w = w0; w <= w1; w++) {
-        ulong m = maskBelow(cut - w * 64);
-        landed += int(popcount(col[w][lane] & m));
-        col[w][lane] &= ~m;
-      }
-      if (d > 0) for (int w = w0; w <= w1; w++) {
-        ulong next = w + 1 <= w1 ? col[w + 1][lane] : 0ul;
-        col[w][lane] = (col[w][lane] >> ulong(d)) | (next << ulong(64 - d));
-      }
-      int lo = -1, hi = 0;
-      for (int w = w0; w <= w1; w++) {
-        ulong v2 = col[w][lane];
-        vox[addr(x, z, w)] = v2;
-        if (v2 != 0ul) { if (lo < 0) lo = w * 64 + int(ctz(v2)); hi = w * 64 + 64 - int(clz(v2)); }
-      }
-      FV[ci] = lo < 0 ? float2(0.0f) : float2(v, s - float(d));
-      if (landed > 0) atomic_fetch_add_explicit(&tgLanded, landed, memory_order_relaxed);
-      if (lo >= 0) { atomic_fetch_min_explicit(&tgLo, uint(lo), memory_order_relaxed); atomic_fetch_max_explicit(&tgHi, uint(hi), memory_order_relaxed); }
-      atomic_store_explicit(&tgAny, 1u, memory_order_relaxed);
-    } else if (fv.x != 0.0f) FV[ci] = float2(0.0f);
+  // airborne sand of this tile lies in [ae.x, ae.y); the word below it receives what falls out of the lowest one
+  int w0 = max(0, int(ae.x >> 6) - 1), w1 = min(WORDS - 1, int((ae.y - 1u) >> 6));
+  uint ci = colIdx(x, z);
+  float2 fv = FV[ci];
+  float v = min(fv.x + G, VMAX), s = fv.y + v;
+  int d = int(floor(s));
+  int cut = int(HF[ci]) + d;                 // everything below this reaches the pile (or the floor) this tick
+  int landed = 0, lo = -1, hi = 0;
+  ulong raw = vox[addr(x, z, w0)];
+  ulong m = maskBelow(cut - w0 * 64);
+  landed += int(popcount(raw & m));
+  ulong cur = raw & ~m;
+  for (int w = w0; w <= w1; w++) {
+    ulong nraw = 0ul, nxt = 0ul;
+    if (w < w1) {
+      nraw = vox[addr(x, z, w + 1)];
+      ulong mn = maskBelow(cut - (w + 1) * 64);
+      landed += int(popcount(nraw & mn));
+      nxt = nraw & ~mn;
+    }
+    ulong o = d > 0 ? (cur >> ulong(d)) | (nxt << ulong(64 - d)) : cur;
+    if (o != raw) vox[addr(x, z, w)] = o;
+    if (o != 0ul) { if (lo < 0) lo = w * 64 + int(ctz(o)); hi = w * 64 + 64 - int(clz(o)); }
+    raw = nraw; cur = nxt;
   }
+  if (lo >= 0) FV[ci] = float2(v, s - float(d));
+  else if (fv.x != 0.0f || fv.y != 0.0f) FV[ci] = float2(0.0f);
+  if (landed > 0) atomic_fetch_add_explicit(&tgLanded, landed, memory_order_relaxed);
+  if (lo >= 0) { atomic_fetch_min_explicit(&tgLo, uint(lo), memory_order_relaxed); atomic_fetch_max_explicit(&tgHi, uint(hi), memory_order_relaxed); }
+  if (lo >= 0 || landed > 0) atomic_store_explicit(&tgAny, 1u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (lane == 0 && ae.y > ae.x) {
-    int landed = atomic_load_explicit(&tgLanded, memory_order_relaxed);
-    if (landed > 0) atomic_fetch_add_explicit(&V[tile], landed, memory_order_relaxed);
-    uint L = atomic_load_explicit(&tgLo, memory_order_relaxed), U = atomic_load_explicit(&tgHi, memory_order_relaxed);
-    air[tile] = L < U ? uint2(L, U) : uint2(0u);
+  if (lane == 0) {
+    int L = atomic_load_explicit(&tgLanded, memory_order_relaxed);
+    if (L > 0) atomic_fetch_add_explicit(&V[tile], L, memory_order_relaxed);
+    uint A = atomic_load_explicit(&tgLo, memory_order_relaxed), U = atomic_load_explicit(&tgHi, memory_order_relaxed);
+    air[tile] = A < U ? uint2(A, U) : uint2(0u);
     if (atomic_load_explicit(&tgAny, memory_order_relaxed) != 0u) changed[tile] = 1u;
   }
 }
@@ -193,7 +195,7 @@ kernel void flow(device const int* Vin [[buffer(0)]], device const float2* Qin [
 // no new peaks), integer heights whose sum is exactly the tile's grain count.
 inline float minmod(float a, float b) { return a * b <= 0.0f ? 0.0f : (abs(a) < abs(b) ? a : b); }
 kernel void surface(device const int* V [[buffer(0)]], device uint* HF [[buffer(1)]], device const uint* active [[buffer(2)]],
-                    device const uint2* air [[buffer(3)]], device uint2* bounds [[buffer(4)]],
+                    device const uint2* air [[buffer(3)]], device uint2* bounds [[buffer(4)]], device atomic_uint* pileTop [[buffer(5)]],
                     uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
   threadgroup atomic_int tgSum; threadgroup atomic_uint tgTop;
   uint t = active[tg];
@@ -218,6 +220,7 @@ kernel void surface(device const int* V [[buffer(0)]], device uint* HF [[buffer(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lane == 0) {
     uint top = atomic_load_explicit(&tgTop, memory_order_relaxed);
+    atomic_fetch_max_explicit(pileTop, top, memory_order_relaxed);
     uint2 a = air[t];
     bool hasAir = a.y > a.x;
     uint lo = top > 0u ? 0u : (hasAir ? a.x : 0u), hi = max(top, hasAir ? a.y : 0u);
@@ -225,15 +228,54 @@ kernel void surface(device const int* V [[buffer(0)]], device uint* HF [[buffer(
   }
 }
 
-// Height bounds of each 64x64-column block (8x8 tiles), for the rays to skip empty space.
-kernel void superBounds(device const uint2* tb [[buffer(0)]], device uint2* sb [[buffer(1)]], uint s [[thread_position_in_grid]]) {
+// Height bounds of each 64x64-column block (8x8 tiles), for the rays to skip empty space: of all sand (sb), and of
+// the sand in the air only (sa), which is all a shadow ray has to look for.
+kernel void superBounds(device const uint2* tb [[buffer(0)]], device uint2* sb [[buffer(1)]],
+                        device const uint2* air [[buffer(2)]], device uint2* sa [[buffer(3)]], uint s [[thread_position_in_grid]]) {
   if (s >= SX * SZ) return;
-  int sx = int(s % SX), sz = int(s / SX); uint lo = 0xffffffffu, hi = 0u;
+  int sx = int(s % SX), sz = int(s / SX); uint lo = 0xffffffffu, hi = 0u, alo = 0xffffffffu, ahi = 0u;
   for (int z = 0; z < 8; z++) for (int x = 0; x < 8; x++) {
-    uint2 b = tb[(sz * 8 + z) * TX + sx * 8 + x];
+    uint t = (sz * 8 + z) * TX + sx * 8 + x;
+    uint2 b = tb[t], a = air[t];
     if (b.y > b.x) { lo = min(lo, b.x); hi = max(hi, b.y); }
+    if (a.y > a.x) { alo = min(alo, a.x); ahi = max(ahi, a.y); }
   }
   sb[s] = lo < hi ? uint2(lo, hi) : uint2(0u);
+  sa[s] = alo < ahi ? uint2(alo, ahi) : uint2(0u);
+}
+
+// --- the sun's height over the pile: per tile, the height below which the pile itself blocks the sun. Marches from
+// the tile toward the sun over the tiles' mean heights (bilinear), one tile per step, until the sun's rise passes the
+// pile's highest point. A pixel's pile shadow is then one lookup instead of a ray. Rebuilt only on ticks where
+// something moved; a world at rest keeps it.
+#define SUN_DIR float3(-0.55f, 0.70f, -0.35f)   // toward the sun (the camera's default view faces away from it)
+inline float tileMean(device const int* V, float2 q) {   // q in tile units; tile centres at i + 0.5
+  float2 c = clamp(q - 0.5f, float2(0.0f), float2(TX - 1, TZ - 1));
+  int2 i = min(int2(c), int2(TX - 2, TZ - 2)); float2 f = c - float2(i);
+  uint t = uint(i.y) * TX + uint(i.x);
+  return mix(mix(float(V[t]), float(V[t + 1]), f.x), mix(float(V[t + TX]), float(V[t + TX + 1]), f.x), f.y) / 64.0f;
+}
+kernel void sunShadow(device const int* V [[buffer(0)]], device float* S [[buffer(1)]], device atomic_uint* pileTop [[buffer(2)]],
+                      uint t [[thread_position_in_grid]]) {
+  if (t >= TX * TZ) return;
+  float3 L = normalize(SUN_DIR);
+  float2 dir = normalize(L.xz);
+  float rise = L.y / length(L.xz) * DX;               // sun-ray height gained per tile stepped
+  float top = float(atomic_load_explicit(pileTop, memory_order_relaxed));
+  float2 p = float2(float(t % TX), float(t / TX)) + 0.5f;
+  float best = 0.0f;
+  for (int k = 1; float(k) * rise <= top; k++) {
+    float2 q = p + dir * float(k);
+    if (any(q < float2(0.0f)) || any(q >= float2(TX, TZ))) break;
+    best = max(best, tileMean(V, q) - float(k) * rise);
+  }
+  S[t] = best;
+}
+inline float sunHeight(device const float* S, float x, float z) {   // bilinear, in cells
+  float2 c = clamp(float2(x, z) / DX - 0.5f, float2(0.0f), float2(TX - 1, TZ - 1));
+  int2 i = min(int2(c), int2(TX - 2, TZ - 2)); float2 f = c - float2(i);
+  uint t = uint(i.y) * TX + uint(i.x);
+  return mix(mix(S[t], S[t + 1], f.x), mix(S[t + TX], S[t + TX + 1], f.x), f.y);
 }
 
 struct Seed { int x0; int z0; int size; int y0; int y1; };
@@ -280,7 +322,7 @@ inline ulong rangeMask(int w, int y0, int y1) {
 // First sand cell along the ray before tMax: walks 64x64 blocks, then 8x8 tiles, then columns, skipping any whose
 // sand height range the ray misses. A column is sand below its pile height, plus its airborne bits.
 float trace(float3 o, float3 d, float tMax, device const ulong* vox, device const uint* HF, device const uint2* tb,
-            device const uint2* sb, thread float3& n, thread int3& cell, thread uint& steps) {
+            device const uint2* sb, bool withPile, thread float3& n, thread int3& cell, thread uint& steps) {
   float3 inv = 1.0f / d;
   float3 ta = -o * inv, tc = (float3(WX, HY, WZ) - o) * inv;
   float3 tmin = min(ta, tc), tmax = max(ta, tc);
@@ -306,7 +348,7 @@ float trace(float3 o, float3 d, float tMax, device const ulong* vox, device cons
     float ya = o.y + d.y * t, yb = o.y + d.y * t1;
     int y0 = max(int(floor(min(ya, yb))), int(b.x)), y1 = min(int(floor(max(ya, yb))), int(b.y) - 1);
     if (y0 <= y1) {
-      int pile = int(HF[colIdx(cx, cz)]);   // cells [0, pile) are sand
+      int pile = withPile ? int(HF[colIdx(cx, cz)]) : 0;   // cells [0, pile) are sand
       int hy = -1;
       if (d.y < 0) {
         for (int w = y1 >> 6; w >= (y0 >> 6) && hy < 0; w--) { ulong m = vox[addr(cx, cz, w)] & rangeMask(w, y0, y1); if (m != 0ul) hy = w * 64 + 63 - int(clz(m)); }
@@ -330,6 +372,16 @@ float trace(float3 o, float3 d, float tMax, device const ulong* vox, device cons
   return -1.0f;
 }
 
+// 1 if the sun reaches point p, else 0: under the pile's sun height (one lookup), or behind sand in the air (a ray that
+// only visits tiles with sand in the air, so it costs nothing once everything has landed).
+#define SUN_SLACK 1.0f   // cells: the sun-height map is per tile, the surface per column
+inline float sunlit(float3 p, float3 L, device const ulong* vox, device const uint* HF, device const float* S,
+                    device const uint2* air, device const uint2* superAir, thread uint& steps) {
+  if (p.x >= 0 && p.z >= 0 && p.x < WX && p.z < WZ && p.y + SUN_SLACK < sunHeight(S, p.x, p.z)) return 0.0f;
+  float3 n2; int3 c2;
+  return trace(p, L, 1e30f, vox, HF, air, superAir, false, n2, c2, steps) >= 0 ? 0.0f : 1.0f;
+}
+
 // Writes MetalFX's inputs: colour, depth (reversed: NEAR / view distance, 0 = sky), and motion: per pixel, how many
 // pixels away this surface point was on the previous frame (its spot under the previous camera minus its spot now).
 #define NEAR 1.0f
@@ -337,18 +389,19 @@ kernel void render(texture2d<float, access::write> out [[texture(0)]], texture2d
                    texture2d<float, access::write> motionOut [[texture(2)]],
                    device const ulong* vox [[buffer(0)]], device const uint* HF [[buffer(1)]], device const uint2* tb [[buffer(2)]],
                    device const uint2* sb [[buffer(3)]], constant Cam& C [[buffer(4)]], device atomic_uint* stepsOut [[buffer(5)]],
-                   constant Cam& P [[buffer(6)]], uint2 g [[thread_position_in_grid]]) {
+                   constant Cam& P [[buffer(6)]], device const float* S [[buffer(7)]], device const uint2* air [[buffer(8)]],
+                   device const uint2* superAir [[buffer(9)]], uint2 g [[thread_position_in_grid]]) {
   uint W = out.get_width(), H = out.get_height();
   if (g.x >= W || g.y >= H) return;
   float2 uv = (float2(g) + 0.5f + C.jitter) / float2(W, H) * 2.0f - 1.0f; uv.y = -uv.y;   // jittered within the pixel (TAA)
   float3 d = normalize(C.fwd.xyz + uv.x * C.tanHalf * C.aspect * C.right.xyz + uv.y * C.tanHalf * C.up.xyz);
   d = select(d, float3(1e-7f), abs(d) < 1e-7f);
-  float3 o = C.pos.xyz, L = C.sun.xyz;
+  float3 o = C.pos.xyz, L = normalize(SUN_DIR);
   float3 sky = mix(float3(0.70, 0.80, 0.93), float3(0.30, 0.50, 0.85), saturate(d.y * 2.0f));
   float3 sunCol = float3(1.0, 0.92, 0.80) * 1.15f;
   float tFloor = d.y < 0 ? -o.y / d.y : 1e30f;
   float3 n; int3 cell; uint steps = 0;
-  float th = trace(o, d, tFloor, vox, HF, tb, sb, n, cell, steps);
+  float th = trace(o, d, tFloor, vox, HF, tb, sb, true, n, cell, steps);
   float3 col; float tt;
   if (th >= 0) {
     // The pile is a smooth surface stored as whole-cell heights: light it with its real slope (central differences
@@ -367,7 +420,7 @@ kernel void render(texture2d<float, access::write> out [[texture(0)]], texture2d
     float h = float(pcg(uint(cell.x) ^ pcg(uint(cell.y) ^ pcg(uint(cell.z)))) & 1023u) / 1023.0f;
     float3 base = float3(0.78, 0.62, 0.38) * (0.95f + (0.4f * h - 0.2f) / max(1.0f, footprint));
     float lam = max(dot(n, L), 0.0f), sh = 1.0f;
-    if (C.shadows != 0u && lam > 0) { float3 n2; int3 c2; if (trace(o + d * th + n * (onPile ? 1.5f : 0.01f), L, 1e30f, vox, HF, tb, sb, n2, c2, steps) >= 0) sh = 0.0f; }   // from the smooth surface, clear of its 1 cm steps
+    if (C.shadows != 0u && lam > 0) sh = sunlit(o + d * th + n * (onPile ? 1.5f : 0.01f), L, vox, HF, S, air, superAir, steps);
     col = base * (sky * mix(0.28f, 0.40f, saturate(n.y)) + sunCol * lam * sh);
     tt = th;
   } else if (tFloor < 1e29f) {
@@ -376,7 +429,7 @@ kernel void render(texture2d<float, access::write> out [[texture(0)]], texture2d
     float chk = fmod(abs(floor(fp.x / 256.0f) + floor(fp.z / 256.0f)), 2.0f);
     float3 base = inside ? mix(float3(0.36, 0.35, 0.33), float3(0.42, 0.41, 0.38), chk) : float3(0.30, 0.34, 0.27);
     float sh = 1.0f;
-    if (C.shadows != 0u) { float3 n2; int3 c2; if (trace(fp + float3(0, 0.01f, 0), L, 1e30f, vox, HF, tb, sb, n2, c2, steps) >= 0) sh = 0.0f; }
+    if (C.shadows != 0u) sh = sunlit(fp + float3(0, 0.01f, 0), L, vox, HF, S, air, superAir, steps);
     col = base * (sky * 0.40f + sunCol * max(L.y, 0.0f) * sh);
     tt = tFloor;
   } else { col = sky; tt = 1e30f; }
