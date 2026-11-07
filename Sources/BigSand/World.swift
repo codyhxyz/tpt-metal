@@ -4,7 +4,7 @@ import Foundation
 import QuartzCore
 
 /// An edit, as the shaders see it (Shaders/World.metal, `WEdit`).
-/// The water pass's parameters (Shaders/World.metal, `WaterParams`): counts and phase, then G and damping.
+/// The water pass's parameters (Shaders/World.metal, `WaterParams`): counts and phase, then G and the step length.
 struct WaterParams { var u: SIMD4<UInt32>; var f: SIMD4<Float> }
 
 /// Indirect dispatch arguments for a list, and counters to zero (Shaders/World.metal, `ArgSpec`).
@@ -80,9 +80,6 @@ final class World {
   static let maxF = 1 << 18   // bricks with flowing water at most (W_MAXF)
   /// Cell size in metres, for gravity in the water's flow.
   static let cellMetres = 0.3
-  /// How much of its flow water keeps each step. Not derived: water's real viscosity is negligible at this scale,
-  /// and this damping is what lets waves die down and water go back to sleep.
-  static let waterDamp: Float = 0.99
 
   let NW: Int, NH: Int
   let device: MTLDevice, queue: MTLCommandQueue, q4: MTL4CommandQueue
@@ -385,7 +382,7 @@ final class World {
     // 2b. water flows by its head (the same bricks; the phase picks this step's pairs of columns)
     let dt = 1.0 / stepRate
     var wp = WaterParams(u: SIMD4(UInt32(curCount), stepNo & 3, UInt32(nextCount), 0),
-                         f: SIMD4(Float(9.8 * dt * dt / World.cellMetres), World.waterDamp, 0, 0))
+                         f: SIMD4(Float(9.8 * dt * dt / World.cellMetres), Float(dt), 0, 0))
     e.setBytes(&wp, length: MemoryLayout<WaterParams>.stride, index: 12); e.setBuffer(wetFlag, offset: 0, index: 13)
     run(pWater, .aMove, [grid, tables.buffer, bricks.buffer, ctr, lists[cur], lists[nxt], fresh, bits[nxt], bits[cur], slots.buffer, flows, flowFree])
     fixFree()

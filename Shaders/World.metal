@@ -76,7 +76,13 @@ inline float3 matColor(uint m) {
   uint h = MAT_HEX[min(m, NMAT - 1)];
   return pow(float3((h >> 16) & 255u, (h >> 8) & 255u, h & 255u) / 255.0f, 2.2f);
 }
-inline bool solid(uint m) { return m != AIR && m != WATER; }
+// Water comes in units of 1/128 of a cell, the finest the cell's byte allows: code WATER is a full cell (128 units),
+// codes 129..255 a cell holding 1..127 units. Everything that looks a material up goes through matOf.
+inline bool isWater(uint m) { return m == WATER || m > 128u; }
+inline uint units(uint m) { return m == WATER ? 128u : (m > 128u ? m - 128u : 0u); }
+inline uint waterCode(uint u) { return u == 0u ? uint(AIR) : (u >= 128u ? uint(WATER) : 128u + u); }
+inline uint matOf(uint m) { return m > 128u ? uint(WATER) : (m == 128u ? uint(AIR) : m); }
+inline bool solid(uint m) { return m != AIR && !isWater(m); }
 
 inline uint chunkIdx(int3 c) { return (uint(c.z) * uint(W_CX) + uint(c.x)) * uint(W_CY) + uint(c.y); }
 inline int3 chunkOf(uint ci) { uint cy = ci % uint(W_CY), r = ci / uint(W_CY); return int3(r % uint(W_CX), cy, r / uint(W_CX)); }
@@ -385,7 +391,7 @@ struct WEdit { int4 c; int4 chunkLo; int4 brickLo; int r2; uint mat; uint mode; 
 inline uint applyEdit(uint old, bool inside, constant WEdit& E) {
   if (!inside) return old;
   if (E.mode == 0u) return AIR;
-  return (old == AIR || old == WATER) ? E.mat : old;
+  return (old == AIR || isWater(old)) ? E.mat : old;
 }
 inline bool boxTouches(int3 lo, int size, constant WEdit& E) {   // does the sphere reach the box [lo, lo + size)?
   int3 q = clamp(E.c.xyz, lo, lo + size - 1) - E.c.xyz;
@@ -484,7 +490,7 @@ inline Hit trace(float3 o, float3 d, float tMax, float lodK, device const uint* 
         ulong b = ulong(be) * 512ul;
         int3 l = c & 7;
         m = AIR;
-        for (int y = 7; y >= 0 && (m == AIR || m == WATER); y--) {
+        for (int y = 7; y >= 0 && (m == AIR || isWater(m)); y--) {
           uint v = bricks[b + loc(int3(l.x, y, l.z))];
           if (v != AIR) m = v;
         }
@@ -492,12 +498,12 @@ inline Hit trace(float3 o, float3 d, float tMax, float lodK, device const uint* 
       }
       else { m = bricks[ulong(be) * 512ul + loc(c & 7)]; s = 1; }
     }
-    if (m != AIR && m != WATER) { h.t = t; h.cell = c; h.axis = axis; h.mat = m; return h; }
+    if (m != AIR && !isWater(m)) { h.t = t; h.cell = c; h.axis = axis; h.mat = m; return h; }
     int3 lo = c & ~(s - 1);
     float3 te = (float3(lo) + select(float3(0), float3(s), d > 0) - o) * inv;
     int k = te.x <= te.y && te.x <= te.z ? 0 : (te.y <= te.z ? 1 : 2);
     float tn2 = te[k];
-    if (m == WATER) {
+    if (isWater(m)) {
       if (h.tWater < 0) { h.tWater = t; h.wcell = c; h.waxis = i == 0u && axis != 1 ? 1 : axis; }
       h.wet += min(tn2, tExit) - t;
     }
@@ -642,8 +648,8 @@ enum : uint { ST_STATIC = 0, ST_GAS = 1, ST_POWDER = 2, ST_LIQUID = 3 };
 constant uchar MAT_STATE[NMAT] = { ST_GAS, ST_STATIC, ST_POWDER, ST_LIQUID, ST_STATIC, ST_POWDER, ST_POWDER, ST_STATIC, ST_STATIC };
 constant uchar MAT_DENS[NMAT]  = { 1,      255,       16,        10,        255,       5,         25,        255,       255 };
 
-inline bool movable(uint m) { return MAT_STATE[m] != ST_STATIC; }
-inline bool sinksInto(uint a, uint b) { return movable(a) && movable(b) && MAT_DENS[a] > MAT_DENS[b]; }   // a above b swaps
+inline bool movable(uint m) { return MAT_STATE[matOf(m)] != ST_STATIC; }
+inline bool sinksInto(uint a, uint b) { return movable(a) && movable(b) && MAT_DENS[matOf(a)] > MAT_DENS[matOf(b)]; }   // a above b swaps
 
 // The block's cells c[x + 2z + 4y]: 0-3 the bottom layer, 4-7 the top. True if anything moved.
 inline bool stepBlock(thread uint* c, uint r) {
@@ -653,10 +659,17 @@ inline bool stepBlock(thread uint* c, uint r) {
   for (uint k = 0; k < 4u; k++) if (sinksInto(c[k + 4], c[k])) {
     uint t = c[k]; c[k] = c[k + 4]; c[k + 4] = t; done |= (1u << k) | (1u << (k + 4)); any = true;
   }
+  // water on a part-filled water cell pours its units into it
+  for (uint k = 0; k < 4u; k++) {
+    uint top = units(c[k + 4]), bot = units(c[k]);
+    if (!top || !isWater(c[k]) || bot >= 128u) continue;
+    uint m = min(top, 128u - bot);
+    c[k] = waterCode(bot + m); c[k + 4] = waterCode(top - m); done |= (1u << k) | (1u << (k + 4)); any = true;
+  }
   // slide: powders and liquids that couldn't fall go to a lower cell beside them (x, z or diagonal), random order
   for (uint i = 0; i < 4u; i++) {
     uint k = (i + r) & 3u, a = c[k + 4];
-    if ((done >> (k + 4)) & 1u || MAT_STATE[a] < ST_POWDER) continue;
+    if ((done >> (k + 4)) & 1u || MAT_STATE[matOf(a)] < ST_POWDER) continue;
     uint s = (r >> (2 + 2 * i)) % 3u;
     for (uint j = 0; j < 3u; j++) {
       uint b = k ^ (1u + (s + j) % 3u);
@@ -796,7 +809,7 @@ kernel void w_move(device const uint* grid [[buffer(0)]], device const uint* tab
     old[i] = c[i];
   }
   bool wet = false;
-  for (uint i = 0; i < 8u; i++) wet |= old[i] == WATER;
+  for (uint i = 0; i < 8u; i++) wet |= isWater(old[i]);
   if (wet) atomic_store_explicit(&sawWater, 1u, memory_order_relaxed);
   if (stepBlock(c, hash3(lo.x, lo.y, lo.z, P.step))) {
     uint mask = 0;
@@ -833,42 +846,68 @@ kernel void w_wake(device const uint* wake [[buffer(0)]], device atomic_int* ctr
 
 // ---------------------------------------------------------------------------------------------------------------
 // Water. Still water presses with the depth of water above it, so water flows from where its surface (its head) is
-// higher to where it is lower, with momentum: the shallow-water ("virtual pipes") model on the free surface.
+// higher to where it is lower, with momentum, slowed by friction with the ground: the shallow-water equations on
+// the free surface, in "virtual pipe" form between neighbouring columns. Every constant comes from physics:
+//   force     moving one unit (1/128 cell) from a surface at h1 to one at h2 releases energy only if h1 - h2 is more
+//             than one unit, so the push is the head difference less one unit (in units), and water rests flat to
+//             one unit (2.3 mm)
+//   gravity   G = g dt^2 / dx (cells per step per step), times the water's depth: waves run at sqrt(g depth)
+//   friction  Manning's law for a natural bed (n = 0.03 s m^-1/3): deceleration g n^2 |u| u / depth^(4/3), applied
+//             implicitly (unconditionally stable)
+//   stability flow is turned into water every fourth step on each edge (below), so the depth that sets the wave
+//             speed is capped where G depth = 1/16 (a wave crosses less than a quarter of a column per step)
 //
-// A column here is one of a brick's 64 columns of 8 cells; its level is the top of its highest non-air cell in the
-// brick (0..8), and it is wet if that cell is water with air above it (a free surface). Each column owns the flow
-// across its +x and +z edges (cells per step) and what has built up there toward a whole cell, as half floats: 8
-// bytes, kept per brick in a flow slot while the brick is awake.
+// A column is one of a brick's 64 columns of 8 cells. Its head is its surface in units from the brick's floor: the
+// top of its highest non-air cell (a water cell counts its units). It is wet if that cell is water with air above.
+// It owns the flow across its +x and +z edges and the part of a unit built up there, as half floats (8 bytes per
+// column, in a per-brick flow slot held while the brick is awake).
 //
 // A step, per awake brick, one thread per column:
-//   1. levels: one read of the column's 8 cells; masks give the level, whether it is wet, and how much water lies
-//      on top (count-leading-zeros, no loops over cells)
-//   2. flows: flow = flow * damp + G * (head difference less one cell), so a one-cell step is level (whole cells can do
-//      no better) and stops; no flow out of a dry column or into a full one; what builds up adds the flow
-//   3. transfer: on this step's pairs of columns (x pairs on even steps of four, then odd, then z; every column is in
-//      exactly one pair, and the pair's lower column does it), whole cells built up move from the top of one column
-//      to the top of the other, no more than the giver has on top or the taker has room for. One thread writes a
-//      pair's cells, so water is conserved exactly with no atomics.
-// G = g dt^2 / dx: gravity in cells per step per step for the chosen step rate and 30 cm cells (set by the CPU).
+//   1. heads: one read of the column's 8 cells
+//   2. flows on the column's +x and +z edges: push, gravity, friction; no flow out of a dry column or into a full one
+//   3. transfer: on this step's pairs of columns (x pairs of even columns, then odd, then z pairs; every column is in
+//      exactly one pair, and the pair's lower column does it), the whole units built up move from the top of one
+//      column to the top of the other: no more than the giver holds on top or the taker has room for. One thread
+//      writes a pair's cells, so water is conserved exactly, in units, with no atomics.
+//   4. rest: an edge whose push is zero and whose flow and build-up are under one unit is at rest (no unit will ever
+//      cross it); a brick with nothing flowing sleeps.
 
-struct WaterParams { uint cur, phase, next, pad; float G, damp, pad1, pad2; };
+#define W_MANNING 0.03f       // Manning roughness of a natural bed, s m^-1/3
+#define W_CELL_M 0.3f         // metres per cell
 
-// One column's 8 cells (y = 0..7) at a brick's storage: its level, whether it is wet, and the water on its top.
-struct Col { int level; bool wet; int avail; };
+struct WaterParams { uint cur, phase, next, pad; float G, dt, pad1, pad2; };
+
+// One column's 8 cells (y = 0..7): its head in units, whether it is wet, the water stacked on its top (units).
+struct Col { int head; bool wet; int avail; };
 inline Col column(device const uchar* bricks, ulong base, int x, int z, uint above) {
-  Col c; c.level = 0; c.wet = false; c.avail = 0;
-  if (base == ~0ul) { c.level = 8; return c; }                  // no storage: treat as full and dry
-  uint solidOrWater = 0, water = 0;
-  for (int y = 0; y < 8; y++) {
-    uint m = bricks[base + loc(int3(x, y, z))];
-    solidOrWater |= uint(m != AIR) << y; water |= uint(m == WATER) << y;
-  }
-  if (!solidOrWater) return c;
-  int top = 31 - int(clz(solidOrWater));
-  c.level = top + 1;
-  c.wet = ((water >> top) & 1u) && (top < 7 || above == AIR);
-  if (c.wet) c.avail = int(clz(~(water << uint(31 - top))));     // water cells stacked down from the top
+  Col c; c.head = 0; c.wet = false; c.avail = 0;
+  if (base == ~0ul) { c.head = 1024; return c; }                // no storage: full and dry
+  uint cell[8], nonAir = 0;
+  for (int y = 0; y < 8; y++) { cell[y] = bricks[base + loc(int3(x, y, z))]; nonAir |= uint(cell[y] != AIR) << y; }
+  if (!nonAir) return c;
+  int top = 31 - int(clz(nonAir));
+  c.head = top * 128 + (isWater(cell[top]) ? int(units(cell[top])) : 128);
+  if (isWater(cell[top]) && top == 7 && isWater(above)) { c.head = 1024; return c; }   // the surface is above this brick
+  c.wet = isWater(cell[top]);
+  for (int y = top; c.wet && y >= 0 && isWater(cell[y]); y--) c.avail += int(units(cell[y]));   // the water stacked on top
   return c;
+}
+
+// Take k units off the top of a column whose head is `head` / put k on top of one whose head is `head`.
+inline void takeUnits(device uchar* bricks, ulong base, int x, int z, int head, int k) {
+  for (int y = (head - 1) >> 7; k > 0 && y >= 0; y--) {          // k never exceeds the column's avail
+    ulong a = base + loc(int3(x, y, z));
+    int u = int(units(bricks[a])), d = min(u, k);
+    bricks[a] = uchar(waterCode(uint(u - d))); k -= d;
+  }
+}
+inline void putUnits(device uchar* bricks, ulong base, int x, int z, int head, int k) {
+  int y = head >> 7, f = head & 127;                             // the part-filled top cell, or the empty cell above
+  for (; k > 0 && y < 8; y++, f = 0) {
+    ulong a = base + loc(int3(x, y, z));
+    int u = f ? int(units(bricks[a])) : 0, d = min(128 - u, k);
+    bricks[a] = uchar(waterCode(uint(u + d))); k -= d;
+  }
 }
 
 kernel void w_water(device const uint* grid [[buffer(0)]], device const uint* tables [[buffer(1)]], device uchar* bricks [[buffer(2)]],
@@ -878,7 +917,7 @@ kernel void w_water(device const uint* grid [[buffer(0)]], device const uint* ta
                     constant WaterParams& P [[buffer(12)]], device const uchar* wetFlag [[buffer(13)]],
                     uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
   threadgroup ulong base[8];          // the brick and its +x/+y/+z neighbours in the pool (~0: no storage)
-  threadgroup short lvl[64], avl[64];
+  threadgroup short headS[64], availS[64];
   threadgroup bool wetS[64];
   threadgroup uint slotS;
   threadgroup bool newSlot;
@@ -905,9 +944,8 @@ kernel void w_water(device const uint* grid [[buffer(0)]], device const uint* ta
   uint above = base[4] != ~0ul ? uint(bricks[base[4] + loc(int3(x, 0, z))])
                                : (brickInWorld(b + int3(0, 1, 0)) ? cellAt(b * 8 + int3(x, 8, z), grid, tables, bricks) : uint(AIR));
   Col me = column(bricks, base[0], x, z, above);
-  lvl[t] = short(me.level); avl[t] = short(me.avail); wetS[t] = me.wet;
+  headS[t] = short(me.head); availS[t] = short(me.avail); wetS[t] = me.wet;
   if (me.wet) atomic_store_explicit(&anyWet, 1u, memory_order_relaxed);
-  // a wet column next to a lower column across the brick's -x / -z side wakes the brick there (it owns that edge)
   threadgroup_barrier(mem_flags::mem_threadgroup);
   // the brick's flow slot: a brick with a free surface gets one; a dry brick without one has nothing to do
   if (t == 0u) {
@@ -922,31 +960,37 @@ kernel void w_water(device const uint* grid [[buffer(0)]], device const uint* ta
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (slotS == 0u) return;
   device half4* F = flows + ulong(slotS - 1u) * 64ul;
-  half4 f = newSlot ? half4(0) : F[t];              // x flow, x built up, z flow, z built up (a new slot starts at rest)
+  half4 f = newSlot ? half4(0) : F[t];              // x flow, x built up, z flow, z built up (units; a new slot is at rest)
   // the +x and +z neighbour columns (in the next brick at the edge)
   Col nx, nz;
-  if (x < 7) { nx.level = lvl[t + 1]; nx.wet = wetS[t + 1]; nx.avail = avl[t + 1]; }
+  if (x < 7) { nx.head = headS[t + 1]; nx.wet = wetS[t + 1]; nx.avail = availS[t + 1]; }
   else {
     uint ab = brickInWorld(b + int3(1, 1, 0)) ? cellAt(b * 8 + int3(8, 8, z), grid, tables, bricks) : uint(AIR);
     nx = column(bricks, base[1], 0, z, ab);
   }
-  if (z < 7) { nz.level = lvl[t + 8]; nz.wet = wetS[t + 8]; nz.avail = avl[t + 8]; }
+  if (z < 7) { nz.head = headS[t + 8]; nz.wet = wetS[t + 8]; nz.avail = availS[t + 8]; }
   else {
     uint ab = brickInWorld(b + int3(0, 1, 1)) ? cellAt(b * 8 + int3(x, 8, 8), grid, tables, bricks) : uint(AIR);
     nz = column(bricks, base[2], x, 0, ab);
   }
+  float maxDepth = 1.0f / (16.0f * P.G);            // cells: the stability cap on the depth that sets the wave speed
   uint mask = 0;
   float fl[2] = { float(f.x), float(f.z) }, acc[2] = { float(f.y), float(f.w) };
   Col nb[2] = { nx, nz };
   for (int e = 0; e < 2; e++) {
-    int dh = me.level - nb[e].level;
-    float push = float((dh > 0 ? 1 : (dh < 0 ? -1 : 0)) * max(abs(dh) - 1, 0));
-    float q = fl[e] * P.damp + P.G * push;
-    if ((q > 0 && (!me.wet || nb[e].level >= 8)) || (q < 0 && (!nb[e].wet || me.level >= 8))) q = 0;
-    q = clamp(q, -2.0f, 2.0f);
-    if (abs(q) < 0.01f) q = 0;                     // too slow to ever move a cell: at rest
-    fl[e] = q; acc[e] = clamp(acc[e] + q, -8.0f, 8.0f);
-    if (q == 0) acc[e] = 0;
+    int dh = me.head - nb[e].head;
+    int push = (dh > 0 ? 1 : (dh < 0 ? -1 : 0)) * max(abs(dh) - 1, 0);
+    // the water carrying the flow: both sides' depth where wet (cells), capped for stability
+    float depth = clamp(float(max(me.wet ? me.avail : 0, nb[e].wet ? nb[e].avail : 0)) / 128.0f, 1.0f / 128.0f, maxDepth);
+    float q = fl[e] + P.G * depth * float(push);
+    // friction: u = flow speed (m/s); q /= 1 + dt g n^2 |u| / depth^(4/3)
+    float u = abs(q) / 128.0f / depth * W_CELL_M / P.dt;
+    float dm = depth * W_CELL_M;
+    q /= 1.0f + P.dt * 9.8f * W_MANNING * W_MANNING * u / pow(dm, 4.0f / 3.0f);
+    if ((q > 0 && (!me.wet || nb[e].head >= 1024)) || (q < 0 && (!nb[e].wet || me.head >= 1024))) q = 0;
+    float a = acc[e] + q;
+    if (push == 0 && abs(q) < 1.0f && abs(a) < 1.0f) { q = 0; a = 0; }   // no unit will ever cross: at rest
+    fl[e] = q; acc[e] = a;
     if (q != 0) mask |= 1u << 13;                   // still flowing: this brick stays awake
   }
   // this step's pair: phase 0/1 = x edges of even/odd columns, 2/3 = z edges of even/odd rows
@@ -955,17 +999,15 @@ kernel void w_water(device const uint* grid [[buffer(0)]], device const uint* ta
   if ((mine & 1) == int(P.phase & 1u) && abs(acc[e]) >= 1.0f) {
     bool out = acc[e] > 0;
     Col giver = out ? me : nb[e], taker = out ? nb[e] : me;
-    int k = min(int(abs(acc[e])), min(giver.avail, 8 - taker.level));
+    int k = min(int(abs(acc[e])), min(giver.avail, 1024 - taker.head));
     if (k > 0) {
-      bool edgeBrick = (e == 0 ? x : z) == 7;
-      ulong mineBase = base[0], otherBase = edgeBrick ? base[e == 0 ? 1 : 2] : base[0];
-      int3 mc = int3(x, 0, z), oc = e == 0 ? int3(edgeBrick ? 0 : x + 1, 0, z) : int3(x, 0, edgeBrick ? 0 : z + 1);
-      ulong gb = out ? mineBase : otherBase, tb = out ? otherBase : mineBase;
-      int3 gc = out ? mc : oc, tc = out ? oc : mc;
-      for (int i = 0; i < k; i++) {
-        bricks[gb + loc(int3(gc.x, giver.level - 1 - i, gc.z))] = uchar(AIR);
-        bricks[tb + loc(int3(tc.x, taker.level + i, tc.z))] = uchar(WATER);
-      }
+      bool edgeBrick = mine == 7;
+      ulong otherBase = edgeBrick ? base[e == 0 ? 1 : 2] : base[0];
+      int2 mc = int2(x, z), oc = e == 0 ? int2(edgeBrick ? 0 : x + 1, z) : int2(x, edgeBrick ? 0 : z + 1);
+      ulong gb = out ? base[0] : otherBase, tb = out ? otherBase : base[0];
+      int2 gc = out ? mc : oc, tc = out ? oc : mc;
+      takeUnits(bricks, gb, gc.x, gc.y, giver.head, k);
+      putUnits(bricks, tb, tc.x, tc.y, taker.head, k);
       acc[e] -= out ? float(k) : -float(k);
       mask |= 1u << 13;
       if (edgeBrick) mask |= 1u << (e == 0 ? 14 : 16);
@@ -974,16 +1016,11 @@ kernel void w_water(device const uint* grid [[buffer(0)]], device const uint* ta
   if (fl[0] != 0 && x == 7) mask |= 1u << 14;
   if (fl[1] != 0 && z == 7) mask |= 1u << 16;
   F[t] = half4(half(fl[0]), half(acc[0]), half(fl[1]), half(acc[1]));
-  // a wet column higher than its -x or -z neighbour across the brick's side wakes that brick, which owns the edge
-  if (me.wet && (x == 0 || z == 0)) {
-    if (x == 0 && brickInWorld(b - int3(1, 0, 0))) {
-      int3 w = b * 8 + int3(-1, me.level - 1, z);
-      if (cellAt(w, grid, tables, bricks) == AIR) mask |= 1u << 12;
-    }
-    if (z == 0 && brickInWorld(b - int3(0, 0, 1))) {
-      int3 w = b * 8 + int3(x, me.level - 1, -1);
-      if (cellAt(w, grid, tables, bricks) == AIR) mask |= 1u << 10;
-    }
+  // a wet column next to air across the brick's -x or -z side wakes that brick, which owns the edge between them
+  if (me.wet) {
+    int y = (me.head - 1) >> 7;
+    if (x == 0 && brickInWorld(b - int3(1, 0, 0)) && cellAt(b * 8 + int3(-1, y, z), grid, tables, bricks) == AIR) mask |= 1u << 12;
+    if (z == 0 && brickInWorld(b - int3(0, 0, 1)) && cellAt(b * 8 + int3(x, y, -1), grid, tables, bricks) == AIR) mask |= 1u << 10;
   }
   if (mask) atomic_fetch_or_explicit(&wakeMask, mask, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
