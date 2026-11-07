@@ -109,6 +109,8 @@ final class World {
   /// Physics steps per second: the time scale of falling, since a step moves a grain at most one cell. Set by eye
   /// while playing (`,` halves it, `.` doubles it).
   var stepRate = 30.0
+  /// Smooth surfaces near the camera (Sources/BigSand/Surfaces.swift).
+  private(set) var surfaces: Surfaces!
   let pPresent: MTLRenderPipelineState
   /// Generation report: (stage, GPU ms).
   private(set) var genStages: [(String, Double)] = []
@@ -175,6 +177,8 @@ final class World {
     for b in [grid, owner, tableFree, brickFree, ctr, fresh, storage, chunkList, wake, cbits, wetFlag] + lists + bits { residency.addAllocation(b) }
     residency.commit()
     generate()
+    surfaces = try Surfaces(world: self, lib: lib, fc: fc)
+    residency.commit()
   }
 
   // MARK: counters and memory
@@ -215,7 +219,7 @@ final class World {
   // MARK: generation
 
   /// A fresh island: every edit undone. The pools keep their mapped memory and are filled again from the start.
-  func reset() { generate() }   // generate() also clears the physics: counters, bitmaps, step
+  func reset() { generate(); surfaces.reset() }   // generate() also clears the physics: counters, bitmaps, step
 
   private func generate() {
     let t0 = CACurrentMediaTime()
@@ -453,12 +457,14 @@ final class World {
   // MARK: drawing
 
   func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, motion: MTLTexture, cam: inout Cam, prev: inout Cam) {
+    surfaces.update(cb, camera: SIMD3(cam.pos.x, cam.pos.y, cam.pos.z))
     let e = cb.makeComputeCommandEncoder()!
     e.setComputePipelineState(pRender)
     e.setTexture(tex, index: 0); e.setTexture(depth, index: 1); e.setTexture(motion, index: 2)
     e.setBuffer(grid, offset: 0, index: 0); e.setBuffer(tables.buffer, offset: 0, index: 1); e.setBuffer(bricks.buffer, offset: 0, index: 2)
     e.setBytes(&cam, length: MemoryLayout<Cam>.stride, index: 3); e.setBytes(&prev, length: MemoryLayout<Cam>.stride, index: 4)
     e.setBuffer(ctr, offset: 0, index: 5)
+    surfaces.bind(e)
     e.dispatchThreads(MTLSize(width: tex.width, height: tex.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
     e.endEncoding()
   }
