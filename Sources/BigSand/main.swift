@@ -104,10 +104,14 @@ protocol Scene: AnyObject {
   func startCam() -> FlyCam
   /// Once per rendered frame, before the rays: physics, or the tool. False if it encoded nothing (the buffer is then dropped).
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool
+  /// Once per rendered frame, before the rays: the smooth surfaces (meshing, BLAS and TLAS builds), in a buffer of
+  /// their own so their GPU time shows apart from the rays'. `render` is the frame's render buffer. False if it encoded nothing.
+  func encodeSurfaces(_ cb: MTLCommandBuffer, render: MTLCommandBuffer, cam: Cam) -> Bool
   func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, motion: MTLTexture, cam: inout Cam, prev: inout Cam)
   func encodePresent(_ cb: MTLCommandBuffer, from tex: MTLTexture, pass: MTLRenderPassDescriptor)
   func key(_ code: UInt16, shift: Bool) -> Bool   // true if it handled the key
-  func title(frameMs: Double, drawMs: Double) -> String
+  /// GPU ms of physics, surfaces and rays (medians over the last half second).
+  func title(frameMs: Double, meshMs: Double, drawMs: Double) -> String
   /// Back to the start: the cube hangs in the sky again; the island is generated afresh.
   func reset()
 }
@@ -116,8 +120,9 @@ extension Engine: Scene {
   func makeCommandBuffer() -> MTLCommandBuffer { queue.makeCommandBuffer()! }
   func startCam() -> FlyCam { FlyCam(world: self) }
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { encodeTick(cb); return true }
+  func encodeSurfaces(_ cb: MTLCommandBuffer, render: MTLCommandBuffer, cam: Cam) -> Bool { false }
   func key(_ code: UInt16, shift: Bool) -> Bool { if code == 15 { reset(); return true }; return false }   // R: drop it again
-  func title(frameMs: Double, drawMs: Double) -> String {
+  func title(frameMs: Double, meshMs: Double, drawMs: Double) -> String {
     String(format: "BigSand · %.2f billion grains · physics %.2f ms · draw %.2f ms · %d tiles awake", Double(grains) / 1e9, frameMs, drawMs, activeTiles)
   }
 }
@@ -125,6 +130,9 @@ extension Engine: Scene {
 extension World: Scene {
   func startCam() -> FlyCam { FlyCam(island: self) }
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { frame(cb, dig: dig, place: place) }
+  func encodeSurfaces(_ cb: MTLCommandBuffer, render: MTLCommandBuffer, cam: Cam) -> Bool {
+    surfaces.update(cb, render: render, camera: SIMD3(cam.pos.x, cam.pos.y, cam.pos.z)); return true
+  }
   func key(_ code: UInt16, shift: Bool) -> Bool {
     // 1-8: sand, water, stone, rock, plant, snow, basalt, wall; Tab / Shift-Tab: the next / previous material
     let mats: [UInt16: UInt32] = [18: World.SAND, 19: World.WATER, 20: World.STONE, 21: World.ROCK, 23: World.PLANT,
@@ -140,9 +148,9 @@ extension World: Scene {
     if code == 47 { stepRate = min(480, stepRate * 2); return true }    // .
     return false
   }
-  func title(frameMs: Double, drawMs: Double) -> String {
-    String(format: "Island %d x %d x %d · %.2f GB · draw %.2f ms · physics %.2f ms, %g steps/s, %d bricks awake · tool: %@, radius %d",
-           NW, NH, NW, Double(bytes) / 1e9, drawMs, frameMs, stepRate, awakeBricks, World.names[Int(material)] as NSString, radius)
+  func title(frameMs: Double, meshMs: Double, drawMs: Double) -> String {
+    String(format: "Island %d x %d x %d · %.2f GB · GPU: physics %.2f ms (%g steps/s, %d bricks awake), surfaces %.2f ms, rays %.2f ms · tool: %@, radius %d",
+           NW, NH, NW, Double(bytes) / 1e9, frameMs, stepRate, awakeBricks, meshMs, drawMs, World.names[Int(material)] as NSString, radius)
   }
 }
 
@@ -180,7 +188,7 @@ final class Renderer: NSObject, MTKViewDelegate {
   var prev = Cam(), valid = false, frame = 0
   var running = true, shadows = true
   var last = CACurrentMediaTime(), lastTitle = CACurrentMediaTime()
-  var simMs: [Double] = [], drawMs: [Double] = []
+  var simMs: [Double] = [], meshMs: [Double] = [], drawMs: [Double] = [], cpuMs: [Double] = [], frameMs: [Double] = []
   let lock = NSLock()
   weak var window: NSWindow?
   var reloadPending = false
@@ -215,7 +223,8 @@ final class Renderer: NSObject, MTKViewDelegate {
 
   func draw(in view: MTKView) {
     guard let v = view as? View, let pass = view.currentRenderPassDescriptor, let drawable = view.currentDrawable else { return }
-    let now = CACurrentMediaTime(), dt = Float(min(now - last, 0.1)); last = now
+    let now = CACurrentMediaTime(), dt = Float(min(now - last, 0.1))
+    frameMs.append((now - last) * 1e3); last = now
     // fly
     let speed: Float = cam.speed * (v.shift ? 6 : 1) * dt
     let f = cam.forward, r = simd_normalize(simd_cross(f, SIMD3<Float>(0, 1, 0)))
@@ -248,7 +257,14 @@ final class Renderer: NSObject, MTKViewDelegate {
     frame += 1
     u.jitter = SIMD2(halton(frame % 16 + 1, 2) - 0.5, halton(frame % 16 + 1, 3) - 0.5)
     if !valid { prev = u }
-    let cr = e.makeCommandBuffer()
+    let cm = e.makeCommandBuffer(), cr = e.makeCommandBuffer()
+    if e.encodeSurfaces(cm, render: cr, cam: u) {
+      cm.addCompletedHandler { [weak self] c in
+        guard let self else { return }
+        self.lock.lock(); self.meshMs.append((c.gpuEndTime - c.gpuStartTime) * 1e3); self.lock.unlock()
+      }
+      cm.commit()
+    }
     e.encodeRender(cr, to: tex!, depth: depth!, motion: motion!, cam: &u, prev: &prev)
     s.colorTexture = tex; s.depthTexture = depth; s.motionTexture = motion; s.outputTexture = output
     s.inputContentWidth = w; s.inputContentHeight = h
@@ -265,12 +281,17 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
     cr.commit()
     prev = u; valid = true
+    cpuMs.append((CACurrentMediaTime() - now) * 1e3)
 
     if now - lastTitle > 0.5 {
       lastTitle = now
-      lock.lock(); let sm = median(simMs), d = median(drawMs)
-      simMs.removeAll(); drawMs.removeAll(); lock.unlock()
-      window?.title = e.title(frameMs: sm, drawMs: d) + " · rays \(w) x \(h) -> \(W) x \(H)" + (running ? "" : " · paused")
+      lock.lock(); let sm = median(simMs), mm = median(meshMs), d = median(drawMs)
+      simMs.removeAll(); meshMs.removeAll(); drawMs.removeAll(); lock.unlock()
+      let cpu = median(cpuMs), fr = median(frameMs), worst = frameMs.max() ?? 0
+      cpuMs.removeAll(); frameMs.removeAll()
+      window?.title = e.title(frameMs: sm, meshMs: mm, drawMs: d)
+        + String(format: " · CPU %.2f ms · frame %.1f ms (worst %.1f)", cpu, fr, worst)
+        + " · rays \(w) x \(h) -> \(W) x \(H)" + (running ? "" : " · paused")
     }
   }
 }

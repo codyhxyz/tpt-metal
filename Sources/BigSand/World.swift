@@ -460,7 +460,6 @@ final class World {
   // MARK: drawing
 
   func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, motion: MTLTexture, cam: inout Cam, prev: inout Cam) {
-    surfaces.update(cb, camera: SIMD3(cam.pos.x, cam.pos.y, cam.pos.z))
     let e = cb.makeComputeCommandEncoder()!
     e.setComputePipelineState(pRender)
     e.setTexture(tex, index: 0); e.setTexture(depth, index: 1); e.setTexture(motion, index: 2)

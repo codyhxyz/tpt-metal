@@ -11,7 +11,7 @@ import Synchronization
 ///          consults coverage out to S.radius + 96 and would draw a mesh beyond that twice (mesh and voxels).
 ///   keep   1.15 S.radius: BLASes stay cached for re-entry; beyond it they are dropped.
 ///
-/// A frame (update, in the render's command buffer, before its encoder):
+/// A frame (update, in its own command buffer, committed just before the render's):
 ///   liquids  Liquids.update (its own encoders)
 ///   build    AS encoder: BLASes from finished mesher runs' records; compacted copies of BLASes built earlier
 ///   jobs     compute: this frame's coverage ops and TLAS instance patches, the dirty scan round the camera, the
@@ -172,12 +172,13 @@ final class Surfaces {
 
   // MARK: frame
 
-  /// Once per frame, in the render's command buffer before its encoder: mesh, build, and keep the TLAS current.
-  func update(_ cb: MTLCommandBuffer, camera: SIMD3<Float>) {
+  /// Once per frame, in its own command buffer committed just before the render's (so its GPU time shows apart):
+  /// mesh, build, and keep the TLAS current. Frames count as done when `render`, which reads what this builds, completes.
+  func update(_ cb: MTLCommandBuffer, render: MTLCommandBuffer, camera: SIMD3<Float>) {
     frame += 1
     let f = frame
-    cb.addCompletedHandler { [weak self] _ in _ = self?.done.max(f, ordering: .releasing) }
-    lastCB = cb
+    render.addCompletedHandler { [weak self] _ in _ = self?.done.max(f, ordering: .releasing) }
+    lastCB = render
     let done = self.done.load(ordering: .acquiring)
     releaseGrave(done)
     liquids.update(cb, camera: camera, liquidDirty: liquidDirty)
