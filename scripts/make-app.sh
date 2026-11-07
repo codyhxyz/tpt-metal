@@ -25,9 +25,7 @@ if [[ -f .build/BigSand.metallib ]]; then
   cp .build/BigSand.metallib "$APP/Contents/Resources/BigSand.metallib"
 fi
 # Source fallback: the app compiles this at runtime when no metallib is bundled.
-if [[ -f Shaders/BigSand.metal ]]; then
-  cp Shaders/BigSand.metal "$APP/Contents/Resources/BigSand.metal"
-fi
+cp Shaders/*.metal "$APP/Contents/Resources/"
 
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 codesign --force --sign - --deep "$APP"

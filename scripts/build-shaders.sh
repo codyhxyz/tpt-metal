@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# Compiles Shaders/BigSand.metal ahead of time into .build/BigSand.metallib, so BigSand skips the source compile
+# Compiles Shaders/*.metal ahead of time into one .build/BigSand.metallib, so the app skips the source compile
 # at launch. Needs the Metal Toolchain: xcodebuild -downloadComponent MetalToolchain
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-src="$root/Shaders/BigSand.metal"
 out="$root/.build"
 mkdir -p "$out"
+rm -f "$out/BigSand.metallib"
 
-xcrun -sdk macosx metal -O3 -c "$src" -o "$out/BigSand.air"
-xcrun -sdk macosx metallib "$out/BigSand.air" -o "$out/BigSand.metallib"
-rm -f "$out/BigSand.air"
+airs=()
+for src in "$root"/Shaders/*.metal; do
+  air="$out/$(basename "${src%.metal}").air"
+  xcrun -sdk macosx metal -O3 -c "$src" -o "$air"
+  airs+=("$air")
+done
+xcrun -sdk macosx metallib "${airs[@]}" -o "$out/BigSand.metallib"
+rm -f "${airs[@]}"
 echo "built $out/BigSand.metallib"

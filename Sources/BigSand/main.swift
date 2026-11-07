@@ -4,18 +4,23 @@ import ImageIO
 import UniformTypeIdentifiers
 import MetalFX
 
-// BigSand: a cube of sand falls and piles up.
-//   swift run -c release BigSand                 window: WASD/QE fly, drag to look, Shift fast, R drop again, Space pause, F shadows
-//   swift run -c release BigSand --shots [N]     headless: N ticks, a few saved frames, GPU ms per pass, grain census
-//   --cube S (either mode): a cube S cells on a side (multiple of 64; default 1024, 1.07 G grains; 4096 is 68.7 G)
+// BigSand: a general voxel world (an island, every cell one byte of material) you fly over, dig and build in; or,
+// with --cube, a cube of sand that falls and piles up.
+//   swift run -c release BigSand                 window: click to grab the mouse (Esc lets go), WASD/QE fly,
+//                                                 Shift fast, scroll for fly speed, F shadows
+//       island: left mouse digs, right mouse places, 1-8 pick the material, [ ] the tool's radius
+//       cube:   R drop again, Space pause
+//   swift run -c release BigSand --cube S --shots [N]   headless cube benchmark
+//   --world S: an island world S cells across (multiple of 64; default 16384), 1024 tall
+//   --cube S:  the falling cube instead, S cells on a side (multiple of 64; 1024 is 1.07 G grains, 4096 is 68.7 G)
 
 
 // MARK: - headless benchmark
 
-func savePNG(_ tex: MTLTexture, _ engine: Engine, _ path: String) {
+func savePNG(_ tex: MTLTexture, _ device: MTLDevice, _ queue: MTLCommandQueue, _ path: String) {
   let w = tex.width, h = tex.height
-  let buf = engine.device.makeBuffer(length: w * h * 8, options: .storageModeShared)!
-  let cb = engine.queue.makeCommandBuffer()!, b = cb.makeBlitCommandEncoder()!
+  let buf = device.makeBuffer(length: w * h * 8, options: .storageModeShared)!
+  let cb = queue.makeCommandBuffer()!, b = cb.makeBlitCommandEncoder()!
   b.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(), sourceSize: MTLSize(width: w, height: h, depth: 1),
          to: buf, destinationOffset: 0, destinationBytesPerRow: w * 8, destinationBytesPerImage: w * h * 8)
   b.endEncoding(); cb.commit(); cb.waitUntilCompleted()
@@ -75,7 +80,7 @@ func shots(ticks: Int, outDir: String, cube: Int) throws {
       var same = cam; e.encodeRender(cr, to: tex, depth: depth, motion: motion, cam: &cam, prev: &same)
       cr.commit(); cr.waitUntilCompleted()
       draw.append((cr.gpuEndTime - cr.gpuStartTime) * 1e3)
-      savePNG(tex, e, "\(outDir)/tick-\(i).png")
+      savePNG(tex, e.device, e.queue, "\(outDir)/tick-\(i).png")
     }
     if i % 2 == 0 && (at.contains(i) || i % 50 == 0) {
       print(String(format: "%4d ", i) + row.map { String(format: " %6.2f", $0) }.joined() + String(format: "    |            %8d", e.activeTiles))
@@ -92,34 +97,82 @@ func shots(ticks: Int, outDir: String, cube: Int) throws {
 
 // MARK: - window
 
-final class View: MTKView {
-  var keys = Set<UInt16>(), shift = false
-  var drag: ((CGFloat, CGFloat) -> Void)?
-  override var acceptsFirstResponder: Bool { true }
-  override func keyDown(with ev: NSEvent) { keys.insert(ev.keyCode) }
-  override func keyUp(with ev: NSEvent) { keys.remove(ev.keyCode) }
-  override func flagsChanged(with ev: NSEvent) { shift = ev.modifierFlags.contains(.shift) }
-  override func mouseDragged(with ev: NSEvent) { drag?(ev.deltaX, ev.deltaY) }
+/// What the window shows: the island world or the falling cube.
+protocol Scene: AnyObject {
+  var device: MTLDevice { get }
+  func makeCommandBuffer() -> MTLCommandBuffer
+  func startCam() -> FlyCam
+  /// Once per rendered frame, before the rays: physics, or the tool. False if it encoded nothing (the buffer is then dropped).
+  func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool
+  func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, motion: MTLTexture, cam: inout Cam, prev: inout Cam)
+  func encodePresent(_ cb: MTLCommandBuffer, from tex: MTLTexture, pass: MTLRenderPassDescriptor)
+  func key(_ code: UInt16) -> Bool   // true if it handled the key
+  func title(frameMs: Double, drawMs: Double) -> String
 }
 
-/// Each displayed pair of refreshes: physics ticks once, the rays are traced at a third of the window's resolution
-/// (MetalFX's largest supported upscale, if smaller), MetalFX's temporal scaler turns them into an antialiased frame at
-/// full resolution, and MetalFX's frame interpolator builds the frame halfway between it and the previous one.
-/// The display shows the in-between frame, then the real one: 120 Hz on ProMotion from 60 rendered frames.
+extension Engine: Scene {
+  func makeCommandBuffer() -> MTLCommandBuffer { queue.makeCommandBuffer()! }
+  func startCam() -> FlyCam { FlyCam(world: self) }
+  func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { encodeTick(cb); return true }
+  func key(_ code: UInt16) -> Bool { if code == 15 { reset(); return true }; return false }   // R: drop it again
+  func title(frameMs: Double, drawMs: Double) -> String {
+    String(format: "BigSand · %.2f billion grains · physics %.2f ms · draw %.2f ms · %d tiles awake", Double(grains) / 1e9, frameMs, drawMs, activeTiles)
+  }
+}
+
+extension World: Scene {
+  func startCam() -> FlyCam { FlyCam(island: self) }
+  func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { tool(cb, dig: dig, place: place) }
+  func key(_ code: UInt16) -> Bool {
+    // 1-8: sand, water, stone, rock, plant, snow, basalt, wall
+    let mats: [UInt16: UInt32] = [18: World.SAND, 19: World.WATER, 20: World.STONE, 21: World.ROCK, 23: World.PLANT,
+                                  22: World.SNOW, 26: World.BASALT, 28: World.WALL]
+    if let m = mats[code] { material = m; return true }
+    if code == 33 { radius = max(2, radius * 4 / 5); return true }     // [
+    if code == 30 { radius = min(64, radius * 5 / 4 + 1); return true } // ]
+    return false
+  }
+  func title(frameMs: Double, drawMs: Double) -> String {
+    String(format: "Island %d x %d x %d · %.2f GB · %d bricks · draw %.2f ms · tool: %@, radius %d", NW, NH, NW, Double(bytes) / 1e9,
+           bricksUsed, drawMs, World.names[Int(material)] as NSString, radius)
+  }
+}
+
+final class View: MTKView {
+  var keys = Set<UInt16>(), shift = false
+  var look: ((CGFloat, CGFloat) -> Void)?
+  var scroll: ((CGFloat) -> Void)?
+  var left = false, right = false, captured = false
+  override var acceptsFirstResponder: Bool { true }
+  override func keyDown(with ev: NSEvent) { if ev.keyCode == 53 { release() } else { keys.insert(ev.keyCode) } }
+  override func keyUp(with ev: NSEvent) { keys.remove(ev.keyCode) }
+  override func flagsChanged(with ev: NSEvent) { shift = ev.modifierFlags.contains(.shift) }
+  override func mouseDown(with ev: NSEvent) { if captured { left = true } else { capture() } }
+  override func mouseUp(with ev: NSEvent) { left = false }
+  override func rightMouseDown(with ev: NSEvent) { if captured { right = true } }
+  override func rightMouseUp(with ev: NSEvent) { right = false }
+  override func mouseMoved(with ev: NSEvent) { if captured { look?(ev.deltaX, ev.deltaY) } }
+  override func mouseDragged(with ev: NSEvent) { look?(ev.deltaX, ev.deltaY) }
+  override func rightMouseDragged(with ev: NSEvent) { if captured { look?(ev.deltaX, ev.deltaY) } }
+  override func scrollWheel(with ev: NSEvent) { scroll?(ev.scrollingDeltaY) }
+  /// Mouse-look: the cursor hides and stays put; moves turn the camera.
+  func capture() { CGAssociateMouseAndMouseCursorPosition(0); NSCursor.hide(); captured = true }
+  func release() { if captured { CGAssociateMouseAndMouseCursorPosition(1); NSCursor.unhide() }; captured = false; left = false; right = false }
+}
+
+/// Each refresh: the scene's frame work (physics or the tool, when there is any), the rays traced at a third of the
+/// window's resolution (MetalFX's largest supported upscale, if smaller), and MetalFX's temporal scaler turning them
+/// into an antialiased frame at full resolution. Every displayed frame is a real one, at up to 120 Hz.
 final class Renderer: NSObject, MTKViewDelegate {
-  let e: Engine; var cam = FlyCam(); var tex: MTLTexture?
-  var depth: MTLTexture?, motion: MTLTexture?, scaler: MTLFXTemporalScaler?
-  var outputs: [MTLTexture] = [], oi = 0            // scaler outputs: this frame's and the previous one's
-  var interp: MTLFXFrameInterpolator?, between: MTLTexture?
-  var pending: MTLTexture?                           // the real frame, shown on the refresh after its in-between frame
-  var interpolate = false                            // only on a display that refreshes at 120 Hz or more
+  let e: Scene; var cam = FlyCam(); var tex: MTLTexture?
+  var depth: MTLTexture?, motion: MTLTexture?, scaler: MTLFXTemporalScaler?, output: MTLTexture?
   var prev = Cam(), valid = false, frame = 0
   var running = true, shadows = true
   var last = CACurrentMediaTime(), lastTitle = CACurrentMediaTime()
-  var simMs: [Double] = [], drawMs: [Double] = [], act: [Int] = []
+  var simMs: [Double] = [], drawMs: [Double] = []
   let lock = NSLock()
   weak var window: NSWindow?
-  init(_ e: Engine) { self.e = e; cam = FlyCam(world: e) }
+  init(_ e: Scene) { self.e = e; cam = e.startCam() }
 
   func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) { scaler = nil }
 
@@ -128,73 +181,50 @@ final class Renderer: NSObject, MTKViewDelegate {
     td.usage = use; td.storageMode = .private
     return e.device.makeTexture(descriptor: td)!
   }
-
-  /// Scaler, interpolator and their textures for a window of W x H pixels.
-  private func build(_ view: MTKView, _ W: Int, _ H: Int) {
-    let scale = max(1.0 / 3.0, Double(MTLFXTemporalScalerDescriptor.supportedInputContentMinScale(device: e.device)))
+  /// The scaler and its textures for a window of W x H pixels.
+  private func build(_ W: Int, _ H: Int) {
+    // MetalFX's scale is how much it enlarges (1 to supportedInputContentMaxScale, 3 on an M5): trace at 1/scale.
+    let scale = 1.0 / min(3.0, Double(MTLFXTemporalScalerDescriptor.supportedInputContentMaxScale(device: e.device)))
     let w = max(Int(Double(W) * scale), 1), h = max(Int(Double(H) * scale), 1)
     let d = MTLFXTemporalScalerDescriptor()
     d.inputWidth = w; d.inputHeight = h; d.outputWidth = W; d.outputHeight = H
     d.colorTextureFormat = .rgba16Float; d.depthTextureFormat = .r32Float
     d.motionTextureFormat = .rg16Float; d.outputTextureFormat = .rgba16Float
     guard let s = d.makeTemporalScaler(device: e.device) else { fatalError("MetalFX refused this temporal scaler setup") }
-    interpolate = (view.window?.screen?.maximumFramesPerSecond ?? 60) >= 120 && MTLFXFrameInterpolatorDescriptor.supportsDevice(e.device)
-    var ip: MTLFXFrameInterpolator? = nil
-    if interpolate {
-      let fd = MTLFXFrameInterpolatorDescriptor()
-      fd.colorTextureFormat = .rgba16Float; fd.outputTextureFormat = .rgba16Float
-      fd.depthTextureFormat = .r32Float; fd.motionTextureFormat = .rg16Float
-      fd.inputWidth = w; fd.inputHeight = h; fd.outputWidth = W; fd.outputHeight = H
-      fd.scaler = s
-      ip = fd.makeFrameInterpolator(device: e.device)
-      interpolate = ip != nil
-    }
-    var colorUse = s.colorTextureUsage.union(.shaderWrite), depthUse = s.depthTextureUsage.union(.shaderWrite)
-    var motionUse = s.motionTextureUsage.union(.shaderWrite), outUse = s.outputTextureUsage.union(.shaderRead)
-    if let ip { colorUse.formUnion(.shaderRead); depthUse.formUnion(ip.depthTextureUsage); motionUse.formUnion(ip.motionTextureUsage); outUse.formUnion(ip.colorTextureUsage) }
-    tex = make(.rgba16Float, w, h, colorUse)
-    depth = make(.r32Float, w, h, depthUse)
-    motion = make(.rg16Float, w, h, motionUse)
-    outputs = [make(.rgba16Float, W, H, outUse), make(.rgba16Float, W, H, outUse)]
-    between = ip.map { make(.rgba16Float, W, H, $0.outputTextureUsage.union(.shaderRead)) }
-    scaler = s; interp = ip; pending = nil; valid = false
-    view.preferredFramesPerSecond = interpolate ? 120 : 60
+    tex = make(.rgba16Float, w, h, s.colorTextureUsage.union(.shaderWrite))
+    depth = make(.r32Float, w, h, s.depthTextureUsage.union(.shaderWrite))
+    motion = make(.rg16Float, w, h, s.motionTextureUsage.union(.shaderWrite))
+    output = make(.rgba16Float, W, H, s.outputTextureUsage.union(.shaderRead))
+    scaler = s; valid = false
   }
 
   func draw(in view: MTKView) {
     guard let v = view as? View, let pass = view.currentRenderPassDescriptor, let drawable = view.currentDrawable else { return }
-    // The refresh after an in-between frame shows the real frame rendered with it.
-    if let p = pending {
-      let cr = e.queue.makeCommandBuffer()!
-      e.encodePresent(cr, from: p, pass: pass); cr.present(drawable); cr.commit()
-      pending = nil
-      return
-    }
     let now = CACurrentMediaTime(), dt = Float(min(now - last, 0.1)); last = now
     // fly
-    let speed: Float = cam.speed * (v.shift ? 4 : 1) * dt
+    let speed: Float = cam.speed * (v.shift ? 6 : 1) * dt
     let f = cam.forward, r = simd_normalize(simd_cross(f, SIMD3<Float>(0, 1, 0)))
     for k in v.keys { switch k {
       case 13: cam.pos += f * speed; case 1: cam.pos -= f * speed
       case 2: cam.pos += r * speed; case 0: cam.pos -= r * speed
       case 14: cam.pos.y += speed; case 12: cam.pos.y -= speed
       default: break } }
-    if v.keys.remove(15) != nil { e.reset(); valid = false }  // R: drop it again (and start MetalFX's history over)
+    for k in v.keys where e.key(k) { v.keys.remove(k); if k == 15 { valid = false } }   // the scene's keys (R: start MetalFX's history over too)
     if v.keys.remove(49) != nil { running.toggle() }          // Space
     if v.keys.remove(3) != nil { shadows.toggle() }           // F
 
     let W = max(Int(view.drawableSize.width), 2), H = max(Int(view.drawableSize.height), 2)
-    if scaler == nil || outputs[0].width != W || outputs[0].height != H { build(view, W, H) }
+    if scaler == nil || output!.width != W || output!.height != H { build(W, H) }
     let s = scaler!, w = tex!.width, h = tex!.height
     if running {
-      let cs = e.queue.makeCommandBuffer()!
-      e.encodeTick(cs)
-      cs.addCompletedHandler { [weak self] c in
-        guard let self else { return }
-        let a = self.e.activeTiles
-        self.lock.lock(); self.simMs.append((c.gpuEndTime - c.gpuStartTime) * 1e3); self.act.append(a); self.lock.unlock()
+      let cs = e.makeCommandBuffer()
+      if e.encodeFrame(cs, dig: v.left, place: v.right) {
+        cs.addCompletedHandler { [weak self] c in
+          guard let self else { return }
+          self.lock.lock(); self.simMs.append((c.gpuEndTime - c.gpuStartTime) * 1e3); self.lock.unlock()
+        }
+        cs.commit()
       }
-      cs.commit()
     }
     var u = cam.uniforms(aspect: Float(w) / Float(h), shadows: shadows)
     // a new sub-pixel sample point every frame: the Halton (2, 3) sequence, 16 points
@@ -202,52 +232,38 @@ final class Renderer: NSObject, MTKViewDelegate {
     frame += 1
     u.jitter = SIMD2(halton(frame % 16 + 1, 2) - 0.5, halton(frame % 16 + 1, 3) - 0.5)
     if !valid { prev = u }
-    let cr = e.queue.makeCommandBuffer()!
+    let cr = e.makeCommandBuffer()
     e.encodeRender(cr, to: tex!, depth: depth!, motion: motion!, cam: &u, prev: &prev)
-    let out = outputs[oi]
-    s.colorTexture = tex; s.depthTexture = depth; s.motionTexture = motion; s.outputTexture = out
+    s.colorTexture = tex; s.depthTexture = depth; s.motionTexture = motion; s.outputTexture = output
     s.inputContentWidth = w; s.inputContentHeight = h
     s.jitterOffsetX = u.jitter.x; s.jitterOffsetY = u.jitter.y
     s.motionVectorScaleX = 1; s.motionVectorScaleY = 1
     s.isDepthReversed = true
     s.reset = !valid
     s.encode(commandBuffer: cr)
-    if let ip = interp, valid {
-      ip.colorTexture = out; ip.prevColorTexture = outputs[1 - oi]
-      ip.depthTexture = depth; ip.motionTexture = motion; ip.outputTexture = between
-      ip.motionVectorScaleX = 1; ip.motionVectorScaleY = 1
-      ip.jitterOffsetX = u.jitter.x; ip.jitterOffsetY = u.jitter.y
-      ip.deltaTime = 1.0 / 60.0
-      ip.nearPlane = 1; ip.farPlane = 1e6                     // the rays' depth: reversed, 1 cell / view distance
-      ip.fieldOfView = cam.fovY * 180 / .pi; ip.aspectRatio = Float(W) / Float(H)
-      ip.isDepthReversed = true
-      ip.shouldResetHistory = false
-      ip.encode(commandBuffer: cr)
-      e.encodePresent(cr, from: between!, pass: pass)
-      pending = out
-    } else {
-      e.encodePresent(cr, from: out, pass: pass)
-    }
+    e.encodePresent(cr, from: output!, pass: pass)
     cr.present(drawable)
     cr.addCompletedHandler { [weak self] cb in
       guard let self else { return }
       self.lock.lock(); self.drawMs.append((cb.gpuEndTime - cb.gpuStartTime) * 1e3); self.lock.unlock()
     }
     cr.commit()
-    oi = 1 - oi; prev = u; valid = true
+    prev = u; valid = true
 
     if now - lastTitle > 0.5 {
       lastTitle = now
-      lock.lock(); let sm = median(simMs), d = median(drawMs), a = Int(median(act.map(Double.init)))
-      simMs.removeAll(); drawMs.removeAll(); act.removeAll(); lock.unlock()
-      window?.title = String(format: "BigSand · %.2f billion grains · physics %.2f ms · draw %.2f ms · %d tiles awake · %@%@",
-                             Double(e.grains) / 1e9, sm, d, a, interpolate ? "120 Hz (interpolated)" : "60 Hz", running ? "" : " · paused")
+      lock.lock(); let sm = median(simMs), d = median(drawMs)
+      simMs.removeAll(); drawMs.removeAll(); lock.unlock()
+      window?.title = e.title(frameMs: sm, drawMs: d) + " · rays \(w) x \(h) -> \(W) x \(H)" + (running ? "" : " · paused")
     }
   }
 }
 
 let args = CommandLine.arguments
-let cubeArg = args.firstIndex(of: "--cube").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 1024
+func intArg(_ name: String) -> Int? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } }
+let cubeMode = args.contains("--cube")
+let cubeArg = intArg("--cube") ?? 1024
+let worldArg = intArg("--world") ?? 16384
 if let i = args.firstIndex(of: "--shots") {
   let n = i + 1 < args.count ? Int(args[i + 1]) ?? 400 : 400
   let out = FileManager.default.currentDirectoryPath + "/shots"
@@ -258,7 +274,7 @@ if let i = args.firstIndex(of: "--shots") {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
-let engine = try Engine(cube: cubeArg)
+let engine: Scene = cubeMode ? try Engine(cube: cubeArg) : try World(size: worldArg)
 let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1512, height: 982), styleMask: [.titled, .closable, .resizable, .miniaturizable],
                    backing: .buffered, defer: false)
 let view = View(frame: win.contentView!.bounds, device: engine.device)
@@ -267,7 +283,9 @@ view.preferredFramesPerSecond = 120
 let renderer = Renderer(engine)
 renderer.window = win
 view.delegate = renderer
-view.drag = { dx, dy in renderer.cam.yaw -= Float(dx) * 0.004; renderer.cam.pitch = max(-1.5, min(1.5, renderer.cam.pitch - Float(dy) * 0.004)) }
+view.look = { dx, dy in renderer.cam.yaw -= Float(dx) * 0.003; renderer.cam.pitch = max(-1.5, min(1.5, renderer.cam.pitch - Float(dy) * 0.003)) }
+view.scroll = { dy in renderer.cam.speed = max(4, min(20000, renderer.cam.speed * Float(pow(1.02, Double(dy))))) }
+win.acceptsMouseMovedEvents = true
 win.contentView = view
 win.collectionBehavior = [.fullScreenPrimary]      // full screen (Ctrl-Cmd-F): where macOS Game Mode turns on
 win.center(); win.makeKeyAndOrderFront(nil); win.makeFirstResponder(view)
