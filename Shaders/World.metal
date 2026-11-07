@@ -66,14 +66,53 @@ constant int NH [[function_constant(1)]];   // cells tall (multiple of 64)
 
 namespace wld {
 
-enum : uint { AIR = 0, ROCK = 1, SAND = 2, WATER = 3, PLANT = 4, SNOW = 5, STONE = 6, BASALT = 7, WALL = 8, NMAT = 9 };
+// Material codes 0..127 (128..255 are water's part-filled cells, below). Keep in step with World.swift's names.
+enum : uint {
+  AIR, ROCK, SAND, WATER, PLANT, SNOW, STONE, BASALT, WALL,
+  CLAY, DUST, ASH, SAWDUST, SALT, SHARDS, SCRAP, RUBBLE, NUGGETS, CRYSTAL_DUST, COAL_DUST,
+  WOOD, PLANKS, METAL, BRICK, COAL, SANDSTONE, LIMESTONE, TITANIUM, TUNGSTEN, GOLD,
+  NMAT
+};
+enum : uchar { ST_STATIC = 0, ST_GAS = 1, ST_POWDER = 2, ST_LIQUID = 3 };
 
-// Colours and per-grain variation from Powder Toy 3D's element table (src/elements.js)
-constant uint MAT_HEX[NMAT] = { 0x000000, 0x6a6560, 0xdcbc74, 0x2a78d4, 0x3da236, 0xeef4ff, 0x78726c, 0x353331, 0x59606e };
-constant float MAT_VAR[NMAT] = { 0, 0.12f, 0.22f, 0, 0.25f, 0.06f, 0.18f, 0.10f, 0.05f };
+// One row per material, from Powder Toy 3D's element table (src/elements.js): colour, per-grain colour variation,
+// state, density (elements.js dens; anything heavier sinks under anything lighter, static ones never move).
+struct Mat { uint hex; float var; uchar state, dens; };
+constant Mat MATS[NMAT] = {
+  { 0x000000, 0.00f, ST_GAS,      1 },   // air
+  { 0x6a6560, 0.12f, ST_STATIC, 255 },   // rock
+  { 0xdcbc74, 0.22f, ST_POWDER,  16 },   // sand
+  { 0x2a78d4, 0.00f, ST_LIQUID,  10 },   // water
+  { 0x3da236, 0.25f, ST_STATIC, 255 },   // plant
+  { 0xeef4ff, 0.06f, ST_POWDER,   9 },   // snow
+  { 0x78726c, 0.18f, ST_POWDER,  26 },   // stone
+  { 0x353331, 0.10f, ST_STATIC, 255 },   // basalt
+  { 0x59606e, 0.05f, ST_STATIC, 255 },   // wall
+  { 0xd9d2c3, 0.10f, ST_POWDER,  12 },   // clay
+  { 0xefdcae, 0.12f, ST_POWDER,   6 },   // dust (floats on water)
+  { 0x9b968d, 0.20f, ST_POWDER,   4 },   // ash (floats)
+  { 0xc99a62, 0.20f, ST_POWDER,   4 },   // sawdust (floats)
+  { 0xf0eee8, 0.08f, ST_POWDER,  13 },   // salt
+  { 0xb9dbe3, 0.15f, ST_POWDER,  25 },   // broken glass
+  { 0x8e939c, 0.10f, ST_POWDER,  78 },   // scrap metal
+  { 0xb0705a, 0.20f, ST_POWDER,  19 },   // brick rubble
+  { 0xe7bd45, 0.15f, ST_POWDER, 193 },   // gold nuggets
+  { 0xc3aee0, 0.15f, ST_POWDER,  32 },   // crystal dust
+  { 0x39383c, 0.20f, ST_POWDER,  14 },   // broken coal
+  { 0x7a4a26, 0.12f, ST_STATIC, 255 },   // wood
+  { 0xa8794a, 0.12f, ST_STATIC, 255 },   // planks
+  { 0xa9afba, 0.04f, ST_STATIC, 255 },   // metal
+  { 0xa4553d, 0.10f, ST_STATIC, 255 },   // brick
+  { 0x2c2b2f, 0.10f, ST_STATIC, 255 },   // coal
+  { 0xc39a64, 0.12f, ST_STATIC, 255 },   // sandstone
+  { 0xc9c3b2, 0.08f, ST_STATIC, 255 },   // limestone
+  { 0x9a9ca3, 0.03f, ST_STATIC, 255 },   // titanium
+  { 0x7b7d82, 0.03f, ST_STATIC, 255 },   // tungsten
+  { 0xdcad2c, 0.04f, ST_STATIC, 255 },   // gold
+};
 
 inline float3 matColor(uint m) {
-  uint h = MAT_HEX[min(m, NMAT - 1)];
+  uint h = MATS[min(m, uint(NMAT) - 1u)].hex;
   return pow(float3((h >> 16) & 255u, (h >> 8) & 255u, h & 255u) / 255.0f, 2.2f);
 }
 // Water comes in units of 1/128 of a cell, the finest the cell's byte allows: code WATER is a full cell (128 units),
@@ -547,7 +586,7 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
     if (k >= 0) n[k] = d[k] > 0 ? -1.0f : 1.0f; else n = -d;
     float footprint = h.t * 2.0f * C.tanHalf / float(H);
     float r = float(hash3(h.cell.x, h.cell.y, h.cell.z, 3u) & 1023u) / 1023.0f;
-    float3 base = matColor(h.mat) * (1.0f + MAT_VAR[h.mat] * (2.0f * r - 1.0f) / max(1.0f, footprint));
+    float3 base = matColor(h.mat) * (1.0f + MATS[h.mat].var * (2.0f * r - 1.0f) / max(1.0f, footprint));
     // Minecraft's per-side shade (top 1, north/south 0.8, east/west 0.6, bottom 0.5) on the sky's light, plus the sun
     float side = n.y > 0.5f ? 1.0f : (n.y < -0.5f ? 0.5f : (abs(n.x) > 0.5f ? 0.6f : 0.8f));
     col = base * (W_AMBIENT * side + sunCol * max(dot(n, L), 0.0f));
@@ -643,13 +682,9 @@ fragment float4 w_presentF(WVOut in [[stage_in]], texture2d<float> tex [[texture
 //   wake     every brick an edit changed, and its 26 neighbours, join the next step
 // The awake list and its bitmap come in two copies, this step's and the next, which swap each step.
 
-enum : uint { ST_STATIC = 0, ST_GAS = 1, ST_POWDER = 2, ST_LIQUID = 3 };
-//                                    air       rock       sand       water      plant      snow       stone      basalt     wall
-constant uchar MAT_STATE[NMAT] = { ST_GAS, ST_STATIC, ST_POWDER, ST_LIQUID, ST_STATIC, ST_POWDER, ST_POWDER, ST_STATIC, ST_STATIC };
-constant uchar MAT_DENS[NMAT]  = { 1,      255,       16,        10,        255,       9,         26,        255,       255 };   // elements.js dens
-
-inline bool movable(uint m) { return MAT_STATE[matOf(m)] != ST_STATIC; }
-inline bool sinksInto(uint a, uint b) { return movable(a) && movable(b) && MAT_DENS[matOf(a)] > MAT_DENS[matOf(b)]; }   // a above b swaps
+inline uint stateOf(uint m) { return MATS[matOf(m)].state; }
+inline bool movable(uint m) { return stateOf(m) != ST_STATIC; }
+inline bool sinksInto(uint a, uint b) { return movable(a) && movable(b) && MATS[matOf(a)].dens > MATS[matOf(b)].dens; }   // a above b swaps
 
 // The block's cells c[x + 2z + 4y]: 0-3 the bottom layer, 4-7 the top. True if anything moved.
 inline bool stepBlock(thread uint* c, uint r) {
@@ -669,7 +704,7 @@ inline bool stepBlock(thread uint* c, uint r) {
   // slide: powders and liquids that couldn't fall go to a lower cell beside them (x, z or diagonal), random order
   for (uint i = 0; i < 4u; i++) {
     uint k = (i + r) & 3u, a = c[k + 4];
-    if ((done >> (k + 4)) & 1u || MAT_STATE[matOf(a)] < ST_POWDER) continue;
+    if ((done >> (k + 4)) & 1u || stateOf(a) < ST_POWDER) continue;
     uint s = (r >> (2 + 2 * i)) % 3u;
     for (uint j = 0; j < 3u; j++) {
       uint b = k ^ (1u + (s + j) % 3u);

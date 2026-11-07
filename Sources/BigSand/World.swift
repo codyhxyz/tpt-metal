@@ -65,7 +65,10 @@ final class World {
   // material ids (Shaders/World.metal)
   static let AIR: UInt32 = 0, ROCK: UInt32 = 1, SAND: UInt32 = 2, WATER: UInt32 = 3, PLANT: UInt32 = 4
   static let SNOW: UInt32 = 5, STONE: UInt32 = 6, BASALT: UInt32 = 7, WALL: UInt32 = 8
-  static let names = ["air", "rock", "sand", "water", "plant", "snow", "stone", "basalt", "wall"]
+  static let names = ["air", "rock", "sand", "water", "plant", "snow", "stone", "basalt", "wall",
+                      "clay", "dust", "ash", "sawdust", "salt", "broken glass", "scrap metal", "brick rubble",
+                      "gold nuggets", "crystal dust", "broken coal",
+                      "wood", "planks", "metal", "brick", "coal", "sandstone", "limestone", "titanium", "tungsten", "gold"]
   static let sea = 192
 
   // counters (Shaders/World.metal, C_*)

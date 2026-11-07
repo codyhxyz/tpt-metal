@@ -8,7 +8,7 @@ import MetalFX
 // with --cube, a cube of sand that falls and piles up.
 //   swift run -c release BigSand                 window: click to grab the mouse (Esc lets go), WASD/QE fly,
 //                                                 Shift fast, scroll for fly speed, F shadows
-//       island: left mouse digs, right mouse places, 1-8 pick the material, [ ] the tool's radius
+//       island: left mouse digs, right mouse places, 1-8 or Tab / Shift-Tab pick the material, [ ] the tool's radius
 //       cube:   R drop again, Space pause
 //   swift run -c release BigSand --cube S --shots [N]   headless cube benchmark
 //   --world S: an island world S cells across (multiple of 64; default 16384), 1024 tall
@@ -106,7 +106,7 @@ protocol Scene: AnyObject {
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool
   func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, motion: MTLTexture, cam: inout Cam, prev: inout Cam)
   func encodePresent(_ cb: MTLCommandBuffer, from tex: MTLTexture, pass: MTLRenderPassDescriptor)
-  func key(_ code: UInt16) -> Bool   // true if it handled the key
+  func key(_ code: UInt16, shift: Bool) -> Bool   // true if it handled the key
   func title(frameMs: Double, drawMs: Double) -> String
   /// Back to the start: the cube hangs in the sky again; the island is generated afresh.
   func reset()
@@ -116,7 +116,7 @@ extension Engine: Scene {
   func makeCommandBuffer() -> MTLCommandBuffer { queue.makeCommandBuffer()! }
   func startCam() -> FlyCam { FlyCam(world: self) }
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { encodeTick(cb); return true }
-  func key(_ code: UInt16) -> Bool { if code == 15 { reset(); return true }; return false }   // R: drop it again
+  func key(_ code: UInt16, shift: Bool) -> Bool { if code == 15 { reset(); return true }; return false }   // R: drop it again
   func title(frameMs: Double, drawMs: Double) -> String {
     String(format: "BigSand · %.2f billion grains · physics %.2f ms · draw %.2f ms · %d tiles awake", Double(grains) / 1e9, frameMs, drawMs, activeTiles)
   }
@@ -125,11 +125,15 @@ extension Engine: Scene {
 extension World: Scene {
   func startCam() -> FlyCam { FlyCam(island: self) }
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { frame(cb, dig: dig, place: place) }
-  func key(_ code: UInt16) -> Bool {
-    // 1-8: sand, water, stone, rock, plant, snow, basalt, wall
+  func key(_ code: UInt16, shift: Bool) -> Bool {
+    // 1-8: sand, water, stone, rock, plant, snow, basalt, wall; Tab / Shift-Tab: the next / previous material
     let mats: [UInt16: UInt32] = [18: World.SAND, 19: World.WATER, 20: World.STONE, 21: World.ROCK, 23: World.PLANT,
                                   22: World.SNOW, 26: World.BASALT, 28: World.WALL]
     if let m = mats[code] { material = m; return true }
+    if code == 48 {                                                    // Tab: every material but air, in turn
+      let n = UInt32(World.names.count) - 1
+      material = (material - 1 + (shift ? n - 1 : 1)) % n + 1; return true
+    }
     if code == 33 { radius = max(2, radius * 4 / 5); return true }     // [
     if code == 30 { radius = min(64, radius * 5 / 4 + 1); return true } // ]
     if code == 43 { stepRate = max(1, stepRate / 2); return true }      // ,
@@ -221,7 +225,7 @@ final class Renderer: NSObject, MTKViewDelegate {
       case 14: cam.pos.y += speed; case 12: cam.pos.y -= speed
       default: break } }
     if reloadPending { reloadPending = false; e.reset(); valid = false }
-    for k in v.keys where e.key(k) { v.keys.remove(k); if k == 15 { valid = false } }   // the scene's keys (R: start MetalFX's history over too)
+    for k in v.keys where e.key(k, shift: v.shift) { v.keys.remove(k); if k == 15 { valid = false } }   // the scene's keys (R: start MetalFX's history over too)
     if v.keys.remove(49) != nil { running.toggle() }          // Space
     if v.keys.remove(3) != nil { shadows.toggle() }           // F
 
