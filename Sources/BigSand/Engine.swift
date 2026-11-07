@@ -15,6 +15,7 @@ struct Cam {
 /// 8x8-column tiles (grain count + momentum per tile) and its surface (one height per column).
 /// A tick: plan (which tiles run) -> fall -> `substeps` flow steps -> surface -> bounds for the rays.
 final class Engine {
+  // These must match the #defines WX, WZ, WORDS and SUBSTEPS in Shaders/BigSand.metal.
   let WX = 4096, WZ = 4096, WORDS = 32
   let substeps = 12
   var TILES: Int { (WX / 8) * (WZ / 8) }
@@ -36,7 +37,7 @@ final class Engine {
     let dev = MTLCreateSystemDefaultDevice()!
     device = dev
     queue = dev.makeCommandQueue()!
-    let lib = try dev.makeLibrary(source: shaderSource(wx: 4096, wz: 4096, words: 32, substeps: 12), options: nil)
+    let lib = try loadShaderLibrary(dev)
     func k(_ n: String) throws -> MTLComputePipelineState { try dev.makeComputePipelineState(function: lib.makeFunction(name: n)!) }
     pPlan = try k("plan"); pFlowArgs = try k("flowArgs"); pFall = try k("fall"); pFlow = try k("flow")
     pSurface = try k("surface"); pSuper = try k("superBounds"); pSeed = try k("seed"); pCensus = try k("census"); pRender = try k("render")
@@ -185,4 +186,38 @@ struct FlyCam {
     return Cam(pos: SIMD4(pos, 0), fwd: SIMD4(f, 0), right: SIMD4(r, 0), up: SIMD4(u, 0), sun: SIMD4(sun, 0),
                tanHalf: tan(fovY / 2), aspect: aspect, shadows: shadows ? 1 : 0, stats: stats ? 1 : 0)
   }
+}
+
+/// The shaders: the precompiled BigSand.metallib inside the .app, else the one scripts/build-shaders.sh leaves in
+/// .build/, else Shaders/BigSand.metal compiled from source now (so a plain `swift run` still works).
+private func loadShaderLibrary(_ dev: MTLDevice) throws -> MTLLibrary {
+  let fm = FileManager.default
+  // The package's .build directory, found by walking up from the executable (.build/<triple>/release/BigSand).
+  var buildDir: URL? = nil
+  if let exe = Bundle.main.executableURL {
+    var dir = exe.deletingLastPathComponent()
+    while dir.path != "/" {
+      if dir.lastPathComponent == ".build" { buildDir = dir; break }
+      dir = dir.deletingLastPathComponent()
+    }
+  }
+  let packageRoot = buildDir?.deletingLastPathComponent()
+
+  let libs = [Bundle.main.resourceURL?.appendingPathComponent("BigSand.metallib"),
+              buildDir?.appendingPathComponent("BigSand.metallib")].compactMap { $0 }
+  for url in libs where fm.fileExists(atPath: url.path) {
+    let lib = try dev.makeLibrary(URL: url)
+    print("shaders: precompiled \(url.path)")
+    return lib
+  }
+  let sources = [Bundle.main.resourceURL?.appendingPathComponent("BigSand.metal"),
+                 packageRoot?.appendingPathComponent("Shaders/BigSand.metal"),
+                 URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("Shaders/BigSand.metal")].compactMap { $0 }
+  for url in sources where fm.fileExists(atPath: url.path) {
+    let lib = try dev.makeLibrary(source: try String(contentsOf: url, encoding: .utf8), options: nil)
+    print("shaders: compiled from source \(url.path) (run scripts/build-shaders.sh to skip this)")
+    return lib
+  }
+  throw NSError(domain: "BigSand", code: 1, userInfo: [NSLocalizedDescriptionKey:
+    "no BigSand.metallib or BigSand.metal found (looked in \((libs + sources).map(\.path)))"])
 }
