@@ -5,9 +5,8 @@ import UniformTypeIdentifiers
 
 // BigSand: a cube of sand falls and piles up.
 //   swift run -c release BigSand                 window: WASD/QE fly, drag to look, Shift fast, R drop again, Space pause, F shadows
-//   swift run -c release BigSand --bench [N]     headless: N ticks, timings vs the model, grain census, screenshots
+//   swift run -c release BigSand --shots [N]     headless: N ticks, a few saved frames, grain census
 
-let GBps = 120e9   // measured copy bandwidth (FACTS.md)
 
 // MARK: - headless benchmark
 
@@ -32,42 +31,24 @@ func savePNG(_ tex: MTLTexture, _ engine: Engine, _ path: String) {
 
 func median(_ a: [Double]) -> Double { a.isEmpty ? 0 : a.sorted()[a.count / 2] }
 
-func bench(ticks: Int, outDir: String) throws {
-  let t0 = Date()
+/// Headless look: run `ticks` ticks, save a few frames, check that no grain was created or lost.
+func shots(ticks: Int, outDir: String) throws {
   let e = try Engine()
-  print(String(format: "world %d x %d x %d = %.1f G cells (%.1f GiB of cells); cube %d^3 = %.2f G grains; %d flow rounds/tick; setup %.2f s",
-               e.WX, e.WORDS * 64, e.WZ, Double(e.cells) / 1e9, Double(e.cells / 8) / 1073741824.0,
-               e.cube, Double(e.grains) / 1e9, e.rounds, Date().timeIntervalSince(t0)))
   let before = e.census()
   let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1512, height: 982, mipmapped: false)
   td.usage = [.shaderWrite, .shaderRead]; td.storageMode = .private
   let tex = e.device.makeTexture(descriptor: td)!
   var cam = FlyCam().uniforms(aspect: 1512.0 / 982.0, shadows: true)
-  struct Row { var tick: Int; var fall: Double; var topple: Double; var draw: Double; var active: Int }
-  var rows: [Row] = []
-  let shots: Set<Int> = [100, 175, 220, 300, 450, ticks - 1]
+  let at: Set<Int> = [60, 90, 110, 140, 200, 300, ticks - 1]
   for i in 0..<ticks {
-    let ca = e.queue.makeCommandBuffer()!, cb = e.queue.makeCommandBuffer()!
-    e.encodeTick(ca, cb); ca.commit(); cb.commit()
-    let cr = e.queue.makeCommandBuffer()!; e.encodeRender(cr, to: tex, cam: &cam); cr.commit()
-    cr.waitUntilCompleted()
-    rows.append(Row(tick: i, fall: (ca.gpuEndTime - ca.gpuStartTime) * 1e3, topple: (cb.gpuEndTime - cb.gpuStartTime) * 1e3,
-                    draw: (cr.gpuEndTime - cr.gpuStartTime) * 1e3, active: e.activeTiles))
-    if shots.contains(i) { savePNG(tex, e, "\(outDir)/tick-\(i).png") }
-    if Date().timeIntervalSince(t0) > 16 { print("(stopped at tick \(i): time cap)"); break }
+    let cb = e.queue.makeCommandBuffer()!
+    e.encodeTick(cb)
+    if at.contains(i) { e.encodeRender(cb, to: tex, cam: &cam) }
+    cb.commit(); cb.waitUntilCompleted()
+    if at.contains(i) { savePNG(tex, e, "\(outDir)/tick-\(i).png") }
   }
   let after = e.census()
-  print("ticks      awake tiles | fall ms (model<=) | flow ms (model, GB/s)   | draw ms")
-  for start in stride(from: 0, to: rows.count, by: 30) {
-    let r = Array(rows[start..<min(start + 30, rows.count)])
-    let act = Int(median(r.map { Double($0.active) }))
-    let fa = median(r.map { $0.fall }), tp = median(r.map { $0.topple })
-    print(String(format: "%4d-%-4d %9d  | %6.2f (%6.2f)    | %6.2f (%5.2f, %5.1f)    | %5.2f", r.first!.tick, r.last!.tick, act,
-                 fa, e.fallBytes(act) / GBps * 1e3, tp, e.toppleBytes(act) / GBps * 1e3, e.toppleBytes(act) / (tp / 1e3) / 1e9,
-                 median(r.map { $0.draw })))
-  }
-  print("grains: \(before) before, \(after) after -> \(before == after ? "conserved" : "LOST \(before - after)")")
-  print(String(format: "total %.1f s; screenshots in %@", Date().timeIntervalSince(t0), outDir))
+  print("grains: \(before) before, \(after) after -> \(before == after ? "conserved" : "CHANGED BY \(after - before)")")
 }
 
 // MARK: - window
@@ -115,15 +96,14 @@ final class Renderer: NSObject, MTKViewDelegate {
       tex = e.device.makeTexture(descriptor: td)
     }
     if running {
-      let ca = e.queue.makeCommandBuffer()!, cb = e.queue.makeCommandBuffer()!
-      e.encodeTick(ca, cb)
-      cb.addCompletedHandler { [weak self] c in
+      let cs = e.queue.makeCommandBuffer()!
+      e.encodeTick(cs)
+      cs.addCompletedHandler { [weak self] c in
         guard let self else { return }
         let a = self.e.activeTiles
-        let ms = (ca.gpuEndTime - ca.gpuStartTime + c.gpuEndTime - c.gpuStartTime) * 1e3
-        self.lock.lock(); self.simMs.append(ms); self.act.append(a); self.lock.unlock()
+        self.lock.lock(); self.simMs.append((c.gpuEndTime - c.gpuStartTime) * 1e3); self.act.append(a); self.lock.unlock()
       }
-      ca.commit(); cb.commit()
+      cs.commit()
     }
     var u = cam.uniforms(aspect: Float(w) / Float(max(h, 1)), shadows: shadows)
     let cr = e.queue.makeCommandBuffer()!
@@ -140,19 +120,18 @@ final class Renderer: NSObject, MTKViewDelegate {
       lastTitle = now
       lock.lock(); let s = median(simMs), d = median(drawMs), a = Int(median(act.map(Double.init)))
       simMs.removeAll(); drawMs.removeAll(); act.removeAll(); lock.unlock()
-      let model = (e.fallBytes(a) + e.toppleBytes(a)) / GBps * 1e3
-      window?.title = String(format: "BigSand · %.2f G grains · physics %.2f ms (model <= %.2f) · draw %.2f ms · %d tiles awake%@",
-                             Double(e.grains) / 1e9, s, model, d, a, running ? "" : " · paused")
+      window?.title = String(format: "BigSand · %.2f billion grains · physics %.2f ms · draw %.2f ms · %d tiles awake%@",
+                             Double(e.grains) / 1e9, s, d, a, running ? "" : " · paused")
     }
   }
 }
 
 let args = CommandLine.arguments
-if let i = args.firstIndex(of: "--bench") {
+if let i = args.firstIndex(of: "--shots") {
   let n = i + 1 < args.count ? Int(args[i + 1]) ?? 400 : 400
-  let out = FileManager.default.currentDirectoryPath + "/bench-out"
+  let out = FileManager.default.currentDirectoryPath + "/shots"
   try? FileManager.default.createDirectory(atPath: out, withIntermediateDirectories: true)
-  try bench(ticks: n, outDir: out)
+  try shots(ticks: n, outDir: out)
   exit(0)
 }
 
