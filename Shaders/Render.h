@@ -48,6 +48,7 @@ inline Walk trace(float3 o, float3 d, float tMax, float lodK, device const uint*
   if (t > 0) axis = tn.x >= tn.y && tn.x >= tn.z ? 0 : (tn.y >= tn.z ? 1 : 2);
   int3 c = clamp(int3(floor(o + d * t)), int3(0), int3(NW, NH, NW) - 1);
   if (axis >= 0) c[axis] = d[axis] > 0 ? 0 : int(dims[axis]) - 1;
+  bool sub = false;                                   // the last box was under clear liquid
   for (uint i = 0; i < 4096u; i++) {
     h.steps++;
     uint m; int s;
@@ -83,12 +84,16 @@ inline Walk trace(float3 o, float3 d, float tMax, float lodK, device const uint*
     float3 te = (float3(lo) + select(float3(0), float3(s), d > 0) - o) * inv;
     int k = te.x <= te.y && te.x <= te.z ? 0 : (te.y <= te.z ? 1 : 2);
     float tn2 = te[k];
-    if (m != AIR) {                                   // a clear liquid
+    // under clear liquid: a clear liquid cell, or, once under water, an mc whose liquid the meshes draw (the walk
+    // sees air there; a ray that dived in a walked mc is still under water, as the meshes' own wet span would count it)
+    bool wetBox = m != AIR || (COV && sub && (cov & 2u) != 0u);
+    if (wetBox) {
       if (h.tWater < 0) { h.tWater = t; h.wcell = packHit(c, i == 0u && axis != 1 ? 1 : axis, 0u); }
       float e = min(tn2, tExit);
       h.wet += e - t;
       if (COV) h.wet -= max(min(e, cv.tw1) - max(t, cv.tw0), 0.0f);
     }
+    sub = wetBox;
     if (tn2 >= tExit) return h;
     t = tn2; axis = k;
     int3 n = clamp(int3(floor(o + d * t)), lo, lo + s - 1);
