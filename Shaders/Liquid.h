@@ -59,19 +59,21 @@ kernel void l_ops(device const uint2* ops [[buffer(0)]], constant uint2& range [
   }
 }
 
-// liquidDirty over the tracked square of mc columns (one word each). Dirty known mcs lose coverage (their slot, if
-// any, is stale) and join the scan list; with no list (list == 0: every frame record is in flight) they keep their
+// liquidDirty over the tracked square of mc columns (one word each). Dirty known mcs join the scan list. One with a
+// slot stays covered: its surface is a frame stale until the refit, which can't be seen, while handing the mc to the
+// voxel walk and back would show (two renderers never agree exactly). One without a slot loses coverage: it may have
+// just got a surface, which only the walk can draw until a slot is made; with no list (list == 0: every frame record is in flight) they keep their
 // dirt for the next frame. Dirt on mcs not known is dropped: they are scanned afresh when they come in.
 struct LDirtyArgs { int x0, z0, w, h; uint list, cap, pad0, pad1; };
 kernel void l_dirty(device atomic_uint* dirty [[buffer(0)]], device const uint* known [[buffer(1)]], device atomic_uint* covered [[buffer(2)]],
                     device atomic_uint* ctl [[buffer(3)]], device uint* scan [[buffer(4)]], constant LDirtyArgs& A [[buffer(5)]],
-                    uint gid [[thread_position_in_grid]]) {
+                    device const uint* hasSlot [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
   if (gid >= uint(A.w * A.h)) return;
   uint w = uint(A.z0 + int(gid) / A.w) * uint(S_MCX) + uint(A.x0 + int(gid) % A.w);
   uint d = atomic_load_explicit(&dirty[w], memory_order_relaxed);
   if (!d) return;
   uint k = d & known[w], listed = 0;
-  if (k) atomic_fetch_and_explicit(&covered[w], ~k, memory_order_relaxed);
+  if (k & ~hasSlot[w]) atomic_fetch_and_explicit(&covered[w], ~(k & ~hasSlot[w]), memory_order_relaxed);
   if (!A.list) return;
   if (k) {
     uint j = atomic_fetch_add_explicit(&ctl[L_C_SCAN], uint(popcount(k)), memory_order_relaxed);

@@ -321,7 +321,7 @@ final class Liquids {
     e.setComputePipelineState(pDirty)
     e.setBuffer(dirty, offset: 0, index: 0); e.setBuffer(known, offset: 0, index: 1); e.setBuffer(covered, offset: 0, index: 2)
     e.setBuffer(rec?.1 ?? covered, offset: Lay.ctl, index: 3); e.setBuffer(rec?.1 ?? covered, offset: rec == nil ? 0 : Lay.scan, index: 4)
-    e.setBytes(&a, length: MemoryLayout<DirtyArgs>.stride, index: 5)
+    e.setBytes(&a, length: MemoryLayout<DirtyArgs>.stride, index: 5); e.setBuffer(hasSlot, offset: 0, index: 6)
     e.dispatchThreads(MTLSize(width: Int(a.w * a.h), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
     if rec == nil { e.endEncoding() } else { e.memoryBarrier(scope: .buffers) }
   }
