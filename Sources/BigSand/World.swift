@@ -74,6 +74,8 @@ final class World {
   let pHeight, pSurface, pBands, pChunks, pBrickClass, pCandArgs, pBrickFill, pCollapse: MTLComputePipelineState
   let pEditChunks, pFixFree, pEditBricks, pEditCollapse, pEditTables, pRender: MTLComputePipelineState
   let pPresent: MTLRenderPipelineState
+  /// The shaders and the world's function constants, for the passes built outside this class (Mesher, SunShadows).
+  let library: ShaderLib, constants: MTLFunctionConstantValues
   /// Generation report: (stage, GPU ms).
   private(set) var genStages: [(String, Double)] = []
   private(set) var genWall = 0.0
@@ -100,6 +102,7 @@ final class World {
     let fc = MTLFunctionConstantValues()
     var consts: [Int32] = [Int32(NW), Int32(NH)]
     for i in 0..<consts.count { fc.setConstantValue(&consts[i], type: .int, index: i) }
+    library = lib; constants = fc
     func fn(_ n: String) throws -> MTLFunction { try lib.makeFunction(name: n, constantValues: fc) }
     func k(_ n: String) throws -> MTLComputePipelineState { try dev.makeComputePipelineState(function: try fn(n)) }
     pHeight = try k("w_height"); pSurface = try k("w_surface"); pBands = try k("w_bands"); pChunks = try k("w_chunks")
@@ -124,6 +127,9 @@ final class World {
     residency.commit()
     generate()
   }
+
+  /// A shader function from Shaders/World.metal, specialised for this world's size.
+  func function(_ name: String) throws -> MTLFunction { try library.makeFunction(name: name, constantValues: constants) }
 
   // MARK: counters and memory
 
