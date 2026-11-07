@@ -38,12 +38,14 @@ func shots(ticks: Int, outDir: String) throws {
   let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1512, height: 982, mipmapped: false)
   td.usage = [.shaderWrite, .shaderRead]; td.storageMode = .private
   let tex = e.device.makeTexture(descriptor: td)!
+  td.pixelFormat = .r32Float
+  let depth = e.device.makeTexture(descriptor: td)!
   var cam = FlyCam().uniforms(aspect: 1512.0 / 982.0, shadows: true)
   let at: Set<Int> = [60, 90, 110, 140, 200, 300, ticks - 1]
   for i in 0..<ticks {
     let cb = e.queue.makeCommandBuffer()!
     e.encodeTick(cb)
-    if at.contains(i) { e.encodeRender(cb, to: tex, cam: &cam) }
+    if at.contains(i) { e.encodeRender(cb, to: tex, depth: depth, cam: &cam) }
     cb.commit(); cb.waitUntilCompleted()
     if at.contains(i) { savePNG(tex, e, "\(outDir)/tick-\(i).png") }
   }
@@ -65,6 +67,7 @@ final class View: MTKView {
 
 final class Renderer: NSObject, MTKViewDelegate {
   let e: Engine; var cam = FlyCam(); var tex: MTLTexture?
+  var depth: MTLTexture?, history: [MTLTexture] = [], hcur = 0, prev = Cam(), valid = false, frame = 0
   var running = true, shadows = true
   var last = CACurrentMediaTime(), lastTitle = CACurrentMediaTime()
   var simMs: [Double] = [], drawMs: [Double] = [], act: [Int] = []
@@ -94,6 +97,10 @@ final class Renderer: NSObject, MTKViewDelegate {
       let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: max(w, 1), height: max(h, 1), mipmapped: false)
       td.usage = [.shaderWrite, .shaderRead]; td.storageMode = .private
       tex = e.device.makeTexture(descriptor: td)
+      history = [e.device.makeTexture(descriptor: td)!, e.device.makeTexture(descriptor: td)!]
+      td.pixelFormat = .r32Float
+      depth = e.device.makeTexture(descriptor: td)
+      valid = false
     }
     if running {
       let cs = e.queue.makeCommandBuffer()!
@@ -106,9 +113,15 @@ final class Renderer: NSObject, MTKViewDelegate {
       cs.commit()
     }
     var u = cam.uniforms(aspect: Float(w) / Float(max(h, 1)), shadows: shadows)
+    // a new sub-pixel sample point every frame: the Halton (2, 3) sequence, 16 points
+    func halton(_ i: Int, _ b: Int) -> Float { var f: Float = 1, r: Float = 0, n = i; while n > 0 { f /= Float(b); r += f * Float(n % b); n /= b }; return r }
+    frame += 1
+    u.jitter = SIMD2(halton(frame % 16 + 1, 2) - 0.5, halton(frame % 16 + 1, 3) - 0.5)
     let cr = e.queue.makeCommandBuffer()!
-    e.encodeRender(cr, to: tex!, cam: &u)
-    e.encodePresent(cr, from: tex!, pass: pass)
+    e.encodeRender(cr, to: tex!, depth: depth!, cam: &u)
+    e.encodeResolve(cr, raw: tex!, depth: depth!, history: history[hcur], into: history[1 - hcur], cam: &u, prev: &prev, valid: valid)
+    hcur = 1 - hcur; prev = u; valid = true
+    e.encodePresent(cr, from: history[hcur], pass: pass)
     cr.present(drawable)
     cr.addCompletedHandler { [weak self] cb in
       guard let self else { return }
