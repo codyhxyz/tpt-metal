@@ -90,10 +90,7 @@ final class World {
   let lists: [MTLBuffer], bits: [MTLBuffer]      // the awake list and its bitmap, this step's and the next
   let fresh, storage, chunkList, wake, cbits: MTLBuffer
   let pArgs, pStorageList, pClearBits, pStorageChunks, pExpandChunks, pExpandBricks, pMove, pWake: MTLComputePipelineState
-  private var li = 0, stepNo: UInt32 = 0, stepDebt = 0.0, lastFrame = CACurrentMediaTime()
-  /// Physics steps per second: the time scale of falling, since a step moves a grain at most one cell. Set by eye
-  /// while playing (`,` halves it, `.` doubles it).
-  var stepRate = 30.0
+  private var li = 0, stepNo: UInt32 = 0
   let pPresent: MTLRenderPipelineState
   /// Generation report: (stage, GPU ms).
   private(set) var genStages: [(String, Double)] = []
@@ -268,7 +265,7 @@ final class World {
     let cb = makeCommandBuffer(), bl = cb.makeBlitCommandEncoder()!
     for b in bits + [cbits] { bl.fill(buffer: b, range: 0..<b.length, value: 0) }
     bl.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-    li = 0; stepNo = 0; stepDebt = 0
+    li = 0; stepNo = 0
     genWall = CACurrentMediaTime() - t0
   }
 
@@ -376,16 +373,11 @@ final class World {
     li = nxt; stepNo &+= 1
   }
 
-  /// Once per frame: the tool, then a physics step when one is due and anything is awake. True if it encoded work.
+  /// Once per frame: the tool, then a physics step when anything is awake. True if it encoded work.
   func frame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool {
-    let now = CACurrentMediaTime(), dt = min(now - lastFrame, 0.1)
-    lastFrame = now
     let edited = tool(cb, dig: dig, place: place)
     // counters from the last finished step (a frame late at most: then this step waits a frame)
-    if !edited && awakeBricks == 0 && counter(.fresh) == 0 && counter(.wake) == 0 { stepDebt = 0; return false }
-    stepDebt = min(stepDebt + dt * stepRate, 1)
-    if stepDebt < 1 { return edited }
-    stepDebt -= 1
+    if !edited && awakeBricks == 0 && counter(.fresh) == 0 && counter(.wake) == 0 { return false }
     reserve(tables: counter(.tBump) + 1024, bricks: counter(.bBump) + 8 * counter(.fresh) + (1 << 16))
     waitForMappings(cb)
     encodeStep(cb)

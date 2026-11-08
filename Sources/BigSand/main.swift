@@ -27,8 +27,6 @@ extension World {
     }
     if code == 33 { radius = max(2, radius * 4 / 5); return true }     // [
     if code == 30 { radius = min(64, radius * 5 / 4 + 1); return true } // ]
-    if code == 43 { stepRate = max(1, stepRate / 2); return true }      // ,
-    if code == 47 { stepRate = min(480, stepRate * 2); return true }    // .
     return false
   }
   func title() -> String { "\(World.names[Int(material)]) r\(radius)" }
