@@ -508,9 +508,7 @@ struct WCam {
 
 struct Hit { float t; int3 cell; int axis; uint mat; float wet; float tWater; int3 wcell; int waxis; uint steps; };
 
-// lodK: cells a pixel spans per unit of distance. Where a brick is smaller than a pixel, the ray stops walking its
-// cells and takes it as one block: the top solid cell of the brick's column under the ray.
-inline Hit trace(float3 o, float3 d, float tMax, float lodK, device const uint* grid, device const uint* tables, device const uchar* bricks) {
+inline Hit trace(float3 o, float3 d, float tMax, device const uint* grid, device const uint* tables, device const uchar* bricks) {
   Hit h; h.t = -1; h.mat = AIR; h.wet = 0; h.tWater = -1; h.steps = 0; h.axis = -1; h.waxis = -1;
   float3 inv = 1.0f / d, dims = float3(NW, NH, NW);
   float3 ta = (0.0f - o) * inv, tb = (dims - o) * inv, tn = min(ta, tb), tf = max(ta, tb);
@@ -527,16 +525,6 @@ inline Hit trace(float3 o, float3 d, float tMax, float lodK, device const uint* 
     else {
       uint be = tables[ulong(ce) * 512ul + loc((c >> 3) & 7)];
       if (be & W_UNI) { m = be & 255u; s = 8; }
-      else if (t * lodK >= 8.0f) {
-        ulong b = ulong(be) * 512ul;
-        int3 l = c & 7;
-        m = AIR;
-        for (int y = 7; y >= 0 && (m == AIR || isClear(m)); y--) {
-          uint v = bricks[b + loc(int3(l.x, y, l.z))];
-          if (v != AIR) m = v;
-        }
-        s = 8;
-      }
       else { m = bricks[ulong(be) * 512ul + loc(c & 7)]; s = 1; }
     }
     if (!isClear(m)) { h.t = t; h.cell = c; h.axis = axis; h.mat = m; return h; }
@@ -579,7 +567,7 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
   float tSea = d.y < 0 && o.y > float(W_SEA) ? (float(W_SEA) - o.y) / d.y : 1e30f;
   float2 ps = o.xz + d.xz * tSea;
   bool seaOut = tSea < 1e29f && (ps.x < 0 || ps.y < 0 || ps.x > float(NW) || ps.y > float(NW));
-  Hit h = trace(o, d, seaOut ? tSea : 1e30f, 2.0f * C.tanHalf / float(H), grid, tables, bricks);
+  Hit h = trace(o, d, seaOut ? tSea : 1e30f, grid, tables, bricks);
   uint steps = h.steps;
   float3 col; float tt;
   bool center = g.x == W / 2 && g.y == H / 2;
