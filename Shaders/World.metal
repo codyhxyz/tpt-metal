@@ -535,7 +535,7 @@ inline Hit trace(float3 o, float3 d, float tMax, device const uint* grid, device
     int k = te.x <= te.y && te.x <= te.z ? 0 : (te.y <= te.z ? 1 : 2);
     float tn2 = te[k];
     if (m != AIR) {                                   // a clear liquid
-      if (h.tWater < 0) { h.tWater = t; h.wcell = c; h.waxis = i == 0u && axis != 1 ? 1 : axis; }
+      if (h.tWater < 0) { h.tWater = t; h.wcell = c; h.waxis = axis; }
       h.wet += min(tn2, tExit) - t;
     }
     if (tn2 >= tExit) return h;
@@ -583,17 +583,15 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
     tt = 1e30f;
   }
   if (h.tWater >= 0) {
-    // light through water: absorbed per cell travelled (red first), then the surface reflects the sky (Fresnel)
+    // light through water: absorbed per cell travelled (red first); a ray that came down through the top reflects
+    // the sky (Fresnel). Side faces and rays starting in water reflect nothing.
     float3 sigma = float3(0.11, 0.035, 0.018);
     float3 tr = exp(-sigma * h.wet);
     float3 deep = float3(0.02, 0.10, 0.16);
     col = col * tr + deep * (1.0f - tr);
-    float3 wn = float3(0, 1, 0);
-    if (h.waxis >= 0 && h.waxis != 1) { wn = float3(0); wn[h.waxis] = d[h.waxis] > 0 ? -1.0f : 1.0f; }
-    float cosv = saturate(-dot(d, wn));
-    if (o.y >= float(W_SEA) || h.waxis != 1) {
-      float F = 0.02f + 0.98f * pow(1.0f - cosv, 5.0f);
-      col = mix(col, skyColor(reflect(d, wn), L), F);
+    if (h.waxis == 1 && d.y < 0) {
+      float F = 0.02f + 0.98f * pow(1.0f + d.y, 5.0f);
+      col = mix(col, skyColor(float3(d.x, -d.y, d.z), L), F);
     }
     if (h.t < 0) tt = h.tWater;
   }
