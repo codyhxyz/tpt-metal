@@ -146,12 +146,15 @@ inline void walkWater(thread Seen& s, Walk h, float3 o, float3 d) {
 // Material colour varied per cell (the variation fades where a cell is smaller than a pixel), lit by the sky and the
 // sun. Voxel faces: Minecraft's per-side shade on the sky's light (top 1, north/south 0.8, east/west 0.6, bottom 0.5).
 // Smooth surfaces: the same falloff from top to bottom, continuous in the normal, so rounded shapes read as round.
-inline float3 shade(uint mat, int3 cell, float3 n, bool smooth, float footprint, float3 L, float3 sunCol) {
+// A grainy material (Grain.h) takes its normal, colour variation, sky occlusion and sun shadow from its grains.
+inline float3 shade(uint mat, int3 cell, bool smooth, float footprint, float3 L, float3 sunCol, GrainOut gr) {
+  float3 n = gr.n;
   float r = float(hash3(cell.x, cell.y, cell.z, 3u) & 1023u) / 1023.0f;
-  float3 base = matColor(mat) * (1.0f + MATS[mat].var * (2.0f * r - 1.0f) / max(1.0f, footprint));
+  float dev = gr.on ? gr.albedo : MATS[mat].var * (2.0f * r - 1.0f) / max(1.0f, footprint);
+  float3 base = matColor(mat) * (1.0f + dev);
   float side = smooth ? 0.7f + n.y * (0.25f + 0.05f * n.y)
                       : (n.y > 0.5f ? 1.0f : (n.y < -0.5f ? 0.5f : (abs(n.x) > 0.5f ? 0.6f : 0.8f)));
-  return base * (W_AMBIENT * side + sunCol * max(dot(n, L), 0.0f));
+  return base * (W_AMBIENT * side * gr.occl + sunCol * max(dot(n, L), 0.0f) * gr.sun);
 }
 
 kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture2d<float, access::write> depthOut [[texture(1)]],
@@ -162,6 +165,9 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
                      device const uint* scover [[buffer(S_BIND_SCOVER)]], device const uint* lcover [[buffer(S_BIND_LCOVER)]],
                      device const packed_float3* lverts [[buffer(S_BIND_LVERTS)]], device const uchar* lkinds [[buffer(S_BIND_LKINDS)]],
                      constant SurfInfo& SI [[buffer(S_BIND_INFO)]],
+                     texture2d<float> gA [[texture(G_TEX_A)]], texture2d<float> gB [[texture(G_TEX_B)]],
+                     texture2d<float> gH0 [[texture(G_TEX_H0)]], texture2d<float> gH1 [[texture(G_TEX_H1)]],
+                     constant GrainFrame& GF [[buffer(G_BIND_FRAME)]],
                      uint2 g [[thread_position_in_grid]]) {
   uint W = out.get_width(), H = out.get_height();
   if (g.x >= W || g.y >= H) return;
@@ -257,7 +263,12 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
   }
   float3 col; float tt;
   if (s.tHit >= 0) {
-    col = shade(s.mat, s.hc, s.n, s.smooth, s.tHit * 2.0f * C.tanHalf / float(H), L, sunCol);
+    GrainIn gi;
+    gi.rel = d * s.tHit; gi.n = s.n; gi.v = -d; gi.L = L; gi.t = s.tHit; gi.pixK = lodK; gi.mat = s.mat;
+    gi.rnd = hash3(int(g.x), int(g.y), as_type<int>(C.jitter.x), as_type<uint>(C.jitter.y));   // new each frame
+    GrainOut gr = grainDetail(gi, GrainRes{gA, gB, gH0, gH1, &GF});
+    s.tHit += gr.dt;
+    col = shade(s.mat, s.hc, s.smooth, s.tHit * lodK, L, sunCol, gr);
     tt = s.tHit;
   } else {
     col = skyColor(d, L);
