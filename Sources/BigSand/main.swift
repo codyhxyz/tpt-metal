@@ -163,7 +163,14 @@ final class View: MTKView {
   override func rightMouseDragged(with ev: NSEvent) { if captured { look?(ev.deltaX, ev.deltaY) } }
   override func scrollWheel(with ev: NSEvent) { scroll?(ev.scrollingDeltaY) }
   /// Mouse-look: the cursor hides and stays put; moves turn the camera.
-  func capture() { CGAssociateMouseAndMouseCursorPosition(0); NSCursor.hide(); captured = true }
+  /// The hidden cursor parks at the window's centre, so clicks land here even when it started over another app.
+  func capture() {
+    if captured { return }
+    if let w = window, let top = NSScreen.screens.first?.frame.maxY {
+      CGWarpMouseCursorPosition(CGPoint(x: w.frame.midX, y: top - w.frame.midY))
+    }
+    CGAssociateMouseAndMouseCursorPosition(0); NSCursor.hide(); captured = true
+  }
   func release() { if captured { CGAssociateMouseAndMouseCursorPosition(1); NSCursor.unhide() }; captured = false; left = false; right = false }
 }
 
@@ -317,5 +324,14 @@ app.mainMenu = mainMenu
 win.contentView = view
 win.collectionBehavior = [.fullScreenPrimary]      // full screen (Ctrl-Cmd-F): where macOS Game Mode turns on
 win.center(); win.makeKeyAndOrderFront(nil); win.makeFirstResponder(view)
+// Grab the mouse as soon as the app is actually frontmost (activation lands after run() starts), and let go
+// whenever it isn't, so Cmd-Tab away never leaves the cursor hidden and frozen.
+var grabbedAtLaunch = false
+NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+  if !grabbedAtLaunch { grabbedAtLaunch = true; view.capture() }
+}
+NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { _ in
+  view.release()
+}
 app.activate(ignoringOtherApps: true)
 app.run()
