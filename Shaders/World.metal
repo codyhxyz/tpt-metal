@@ -121,8 +121,12 @@ inline float3 matColor(uint m) {
   uint h = MATS[min(m, uint(NMAT) - 1u)].hex;
   return pow(float3((h >> 16) & 255u, (h >> 8) & 255u, h & 255u) / 255.0f, 2.2f);
 }
-inline bool isLiquid(uint m) { return m >= uint(WATER); }                           // the liquids come last
-inline bool isClear(uint m) { return MATS[m].clear != 0; }                           // light passes (air, water)
+// A cell's byte: its material in bits 0-5; a liquid keeps the way it last spread in bits 6-7 (0 +x, 1 -x, 2 +z,
+// 3 -z). Every material lookup goes through matOf.
+static_assert(NMAT <= 64, "a material fits bits 0-5 of a cell");
+inline uint matOf(uint m) { return m & 63u; }
+inline bool isLiquid(uint m) { return matOf(m) >= uint(WATER); }                    // the liquids come last
+inline bool isClear(uint m) { return MATS[matOf(m)].clear != 0; }                    // light passes (air, water)
 inline bool solid(uint m) { return m != AIR && !isLiquid(m); }
 
 inline uint chunkIdx(int3 c) { return (uint(c.z) * uint(W_CX) + uint(c.x)) * uint(W_CY) + uint(c.y); }
@@ -135,7 +139,7 @@ inline uint cellAt(int3 c, device const uint* grid, device const uint* tables, d
   if (ce & W_UNI) return ce & 255u;
   uint be = tables[ulong(ce) * 512ul + loc((c >> 3) & 7)];
   if (be & W_UNI) return be & 255u;
-  return bricks[ulong(be) * 512ul + loc(c & 7)];
+  return matOf(bricks[ulong(be) * 512ul + loc(c & 7)]);
 }
 inline bool inWorld(int3 c) { return all(c >= 0) && c.x < NW && c.y < NH && c.z < NW; }
 
@@ -525,7 +529,7 @@ inline Hit trace(float3 o, float3 d, float tMax, device const uint* grid, device
     else {
       uint be = tables[ulong(ce) * 512ul + loc((c >> 3) & 7)];
       if (be & W_UNI) { m = be & 255u; s = 8; }
-      else { m = bricks[ulong(be) * 512ul + loc(c & 7)]; s = 1; }
+      else { m = matOf(bricks[ulong(be) * 512ul + loc(c & 7)]); s = 1; }
     }
     if (!isClear(m)) { h.t = t; h.cell = c; h.axis = axis; h.mat = m; return h; }
     int3 lo = c & ~(s - 1);
@@ -672,12 +676,13 @@ fragment float4 w_presentF(WVOut in [[stage_in]], texture2d<float> tex [[texture
 //   wake     every brick an edit changed, and its 26 neighbours, join the next step
 // The awake list and its bitmap come in two copies, this step's and the next, which swap each step.
 
-inline uint stateOf(uint m) { return MATS[m].state; }
+inline uint stateOf(uint m) { return MATS[matOf(m)].state; }
 inline bool movable(uint m) { return stateOf(m) != ST_STATIC; }
-inline bool sinksInto(uint a, uint b) { return movable(a) && movable(b) && MATS[a].dens > MATS[b].dens; }   // a above b swaps
+inline bool sinksInto(uint a, uint b) { return movable(a) && movable(b) && MATS[matOf(a)].dens > MATS[matOf(b)].dens; }   // a above b swaps
 
-// The block's cells c[x + 2z + 4y]: 0-3 the bottom layer, 4-7 the top. True if anything moved.
-inline bool stepBlock(thread uint* c, uint r) {
+// The block's cells c[x + 2z + 4y]: 0-3 the bottom layer, 4-7 the top; ex: the cells under the bottom layer (0-3)
+// and over the top one (4-7), read only (filled only when the block holds liquid). True if anything moved.
+inline bool stepBlock(thread uint* c, thread const uint* ex, uint r) {
   uint done = 0;   // bit k: cell k already moved this step
   bool any = false;
   // fall: each column, top into bottom
@@ -696,16 +701,30 @@ inline bool stepBlock(thread uint* c, uint r) {
       break;
     }
   }
-  // spread: liquids that haven't moved go into air beside them on their own level (x, z or diagonal), random order.
-  // Only into air: two liquids side by side would trade places forever.
+  // spread: a liquid standing on something goes into air beside it on its own level, along x or z, if that gets it
+  // lower (the cell under the air is open) or liquid above presses on it. Otherwise it stays, and still liquid
+  // writes nothing, so its bricks sleep (a lake is level to a cell; a lone cell on it stays as a bump). It keeps
+  // going the way it went (bits 6-7): the block's x and z neighbours of cell k lie toward dX and dZ; facing out of
+  // the block it waits for the next step's blocks, trying only the side way, and the way back 1 time in 4 (a dead
+  // end). Only into air: two liquids side by side would trade places forever.
   for (uint i = 0; i < 8u; i++) {
     uint k = (i + (r >> 10)) & 7u, a = c[k];
-    if ((done >> k) & 1u || stateOf(a) != ST_LIQUID) continue;
-    uint s = (r >> (14 + 2 * i)) % 3u;
-    for (uint j = 0; j < 3u; j++) {
-      uint b = k ^ (1u + (s + j) % 3u);                // same layer: k ^ 1..3 keeps bit 2
+    if ((done >> k) & 1u || !isLiquid(a)) continue;
+    if (stateOf(k < 4u ? ex[k] : c[k - 4u]) == ST_GAS) continue;     // nothing under it: it falls
+    bool pushed = isLiquid(k >= 4u ? ex[k] : c[k + 4u]);
+    uint dir = a >> 6, dX = k & 1u, dZ = 2u | ((k >> 1) & 1u);
+    uint2 way[2]; uint n = 0;                                          // (cell, direction) to try, in order
+    if (dir == dX) { way[0] = uint2(k ^ 1u, dX); way[1] = uint2(k ^ 2u, dZ); n = 2; }
+    else if (dir == dZ) { way[0] = uint2(k ^ 2u, dZ); way[1] = uint2(k ^ 1u, dX); n = 2; }
+    else {
+      way[0] = dir < 2u ? uint2(k ^ 2u, dZ) : uint2(k ^ 1u, dX); n = 1;
+      if (((r >> (16 + 2 * i)) & 3u) == 0u) { way[1] = dir < 2u ? uint2(k ^ 1u, dX) : uint2(k ^ 2u, dZ); n = 2; }
+    }
+    for (uint j = 0; j < n; j++) {
+      uint b = way[j].x;
       if ((done >> b) & 1u || c[b] != AIR) continue;
-      c[b] = a; c[k] = AIR; done |= (1u << k) | (1u << b); any = true;
+      if (!pushed && stateOf(b < 4u ? ex[b] : c[b - 4u]) != ST_GAS) continue;
+      c[b] = matOf(a) | (way[j].y << 6); c[k] = AIR; done |= (1u << k) | (1u << b); any = true;
       break;
     }
   }
@@ -794,12 +813,13 @@ kernel void w_move(device const uint* grid [[buffer(0)]], device const uint* tab
                    device uint* fresh [[buffer(6)]], device atomic_uint* bitsNext [[buffer(7)]], device const uint* bitsCur [[buffer(8)]],
                    constant MoveParams& P [[buffer(9)]],
                    uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
-  threadgroup ulong base[8];          // where the brick and its forward neighbours start in the pool (~0: no storage)
+  threadgroup ulong base[12];         // where the brick, its forward neighbours and those one brick down start in the
+                                      // pool (~0: no storage): o.x + 2 o.z + 4 (o.y + 1)
   threadgroup atomic_uint wakeMask;   // bit (ox+1) + 3(oz+1) + 9(oy+1): the brick at that offset wakes next step
   if (tg >= min(uint(atomic_load_explicit(&ctr[P.cur], memory_order_relaxed)), W_MAXL)) return;
   int3 b = unpackB(L[tg]);
-  if (t < 8u) {
-    int3 n = b + int3(t & 1u, t >> 2, (t >> 1) & 1u);
+  if (t < 12u) {
+    int3 n = b + int3(int(t & 1u), int(t >> 2) - 1, int((t >> 1) & 1u));
     ulong a = ~0ul;
     if (brickInWorld(n)) {
       uint ce = grid[chunkIdx(n >> 3)];
@@ -815,12 +835,25 @@ kernel void w_move(device const uint* grid [[buffer(0)]], device const uint* tab
   for (uint i = 0; i < 8u; i++) {                      // cell i = x + 2z + 4y of the block
     int3 w = lo + int3(i & 1u, i >> 2, (i >> 1) & 1u);
     int3 o = (w >> 3) - b;
-    ulong a = base[o.x + 2 * o.z + 4 * o.y];
+    ulong a = base[o.x + 2 * o.z + 4 * (o.y + 1)];
     addr[i] = a == ~0ul ? ~0ul : a + loc(w & 7);
     c[i] = addr[i] == ~0ul ? uint(WALL) : uint(bricks[addr[i]]);
     old[i] = c[i];
   }
-  if (stepBlock(c, hash3(lo.x, lo.y, lo.z, P.step))) {
+  // a liquid's spread looks at the cells under and over the block (another block may be moving them: either is fine)
+  uint ex[8];
+  bool wet = false;
+  for (uint i = 0; i < 8u; i++) wet |= isLiquid(c[i]);
+  for (uint j = 0; j < 8u; j++) {
+    ex[j] = uint(WALL);
+    if (!wet) continue;
+    int3 w = lo + int3(int(j & 1u), j < 4u ? -1 : 2, int((j >> 1) & 1u));
+    if (!inWorld(w)) continue;
+    int3 o = (w >> 3) - b;
+    ulong a = base[o.x + 2 * o.z + 4 * (o.y + 1)];
+    ex[j] = a == ~0ul ? cellAt(w, grid, tables, bricks) : uint(bricks[a + loc(w & 7)]);
+  }
+  if (stepBlock(c, ex, hash3(lo.x, lo.y, lo.z, P.step))) {
     uint mask = 0;
     for (uint i = 0; i < 8u; i++) {
       if (c[i] == old[i]) continue;
