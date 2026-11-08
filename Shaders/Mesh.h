@@ -8,6 +8,10 @@
 //            its own dual cube (Gibson's constrained surface nets: smooth slopes and rounded edges, yet a one-cell
 //            feature never collapses)
 //   normal   minus the occupancy gradient under a 6-cell binomial kernel centred on the cube's centre
+// Loose stuff keeps its cells' lumps: a vertex whose dual cube's solid cells are all powders skips both relaxations
+// (it stays at its base vertex) and takes its normal from the next binomial kernel down, 4 cells, so a pile reads as
+// the cells it is made of, as tpt3d's lightly blurred powders do. A vertex touching any non-powder solid is rounded
+// as before. The test reads only the cube's 8 cells, so both mcs at a seam decide alike.
 // A vertex at d after two relaxations depends on cells d-2 .. d+3; an mc's vertices have d in [-1, 31] (relative),
 // so an mc reads cells [-3, 34]: exactly S_HALO. Two mcs sharing a vertex run the same arithmetic on the same cells:
 // seams are bit-identical. Outside the world, cells repeat the nearest edge cell: no faces on the world's walls.
@@ -72,6 +76,9 @@ constant uint SN_V0[256] = {
 // Gradient kernel over 6 cells: smoothing B5 = 1 5 10 10 5 1, derivative = the differences of B4 (1 4 6 4 1).
 constant int SN_SW[6] = { 1, 5, 10, 10, 5, 1 };
 constant int SN_DW[6] = { -1, -3, -2, 2, 3, 1 };
+// 4 cells: smoothing B3 = 1 3 3 1, derivative = the differences of B2 (1 2 1).
+constant int SN_SW4[4] = { 1, 3, 3, 1 };
+constant int SN_DW4[4] = { -1, -1, 1, 1 };
 
 // 8 cells (one brick row along x, little-endian) -> 8 solid bits: the byte is nonzero and below 128 (not liquid).
 inline uint snSolid8(ulong w) {
@@ -161,6 +168,38 @@ inline float3 snNormal(thread const ulong* W, threadgroup const uint* glut) {
   return all(g == 0) ? float3(0.0f, 1.0f, 0.0f) : -float3(g);
 }
 
+// The same over the window's middle 4 cells (cells d - 1 .. d + 2): window bits 1..4 of each row, slices 1..4.
+inline float3 snNormal4(thread const ulong* W, threadgroup const uint* glut4) {
+  int3 g = 0;
+  #pragma unroll
+  for (int k = 0; k < 4; k++) {
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      uint e = glut4[uint(W[k + 1] >> (6 * (j + 1) + 1)) & 15u];
+      int s = int(e & 0xffffu), d = int(e) >> 16;
+      g += int3(d * SN_SW4[j] * SN_SW4[k], s * SN_DW4[j] * SN_SW4[k], s * SN_SW4[j] * SN_DW4[k]);
+    }
+  }
+  if (all(g == 0)) {
+    uint c = snCfg(W, 2, 2, 2);
+    g = int3(popcount(c & 0xaau), popcount(c & 0xccu), popcount(c & 0xf0u))
+      - int3(popcount(c & 0x55u), popcount(c & 0x33u), popcount(c & 0x0fu));
+  }
+  return all(g == 0) ? float3(0.0f, 1.0f, 0.0f) : -float3(g);
+}
+
+// Every solid cell of dual cube d (cells d .. d + 1, mc-relative, in [-1, 32]) is a powder. cfg: its corner bits.
+inline bool snLoose(int3 d, uint cfg, threadgroup const uint* brk, device const uchar* bytes) {
+  for (uint i = 0; i < 8u; i++) {
+    if (((cfg >> i) & 1u) == 0u) continue;
+    int3 s = d + int3(i & 1u, (i >> 1) & 1u, (i >> 2) & 1u);
+    uint e = brk[(uint((s.z >> 3) + 1) * 6u + uint((s.y >> 3) + 1)) * 6u + uint((s.x >> 3) + 1)];
+    uint mat = (e & W_UNI) ? (e & 255u) : uint(bytes[ulong(e) * 512ul + loc(s & 7)]);
+    if (MATS[min(mat, uint(NMAT) - 1u)].state != ST_POWDER) return false;
+  }
+  return true;
+}
+
 // Exclusive prefix sums of two counts over the group; total gets the sums.
 inline uint2 snScan(uint2 v, uint lane, uint sg, threadgroup uint2* sums, thread uint2& total) {
   uint2 x = uint2(simd_prefix_exclusive_sum(v.x), simd_prefix_exclusive_sum(v.y));
@@ -193,7 +232,7 @@ kernel void sn_mesh(device const uint* grid [[buffer(0)]], device const uint* ta
                     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup ulong occ[SN_R * SN_R];
   threadgroup uint vmask[SN_V * SN_V], vstart[SN_V * SN_V];
-  threadgroup uint brk[SN_B * SN_B * SN_B], v0[256], glut[64];
+  threadgroup uint brk[SN_B * SN_B * SN_B], v0[256], glut[64], glut4[16];
   threadgroup uint2 sums[SN_SG + 1];
   threadgroup uint flags[SN_SG], stage[3];
 
@@ -214,6 +253,12 @@ kernel void sn_mesh(device const uint* grid [[buffer(0)]], device const uint* ta
     int s = 0, d = 0;
     for (int i = 0; i < 6; i++) if ((t >> i) & 1u) { s += SN_SW[i]; d += SN_DW[i]; }
     glut[t] = uint(s) | (uint(d) << 16);
+  }
+  if (t >= 64u && t < 80u) {
+    uint b = t - 64u;
+    int s = 0, d = 0;
+    for (int i = 0; i < 4; i++) if ((b >> i) & 1u) { s += SN_SW4[i]; d += SN_DW4[i]; }
+    glut4[b] = uint(s) | (uint(d) << 16);
   }
   f = simd_or(f);
   if (lane == 0u) flags[sg] = f;
@@ -307,6 +352,7 @@ kernel void sn_mesh(device const uint* grid [[buffer(0)]], device const uint* ta
   threadgroup_barrier(mem_flags::mem_device);
 
   // 5. vertices: position and normal from the 6^3-cell window
+  device const uchar* bytes = (device const uchar*)bricks;
   for (uint i = t; i < nv; i += SN_T) {
     uint desc = scratch[vo + i];
     int3 d = int3(desc & 63u, (desc >> 6) & 63u, desc >> 12) - 1;
@@ -320,14 +366,16 @@ kernel void sn_mesh(device const uint* grid [[buffer(0)]], device const uint* ta
       W[k] = w;
     }
     // window cube 2 is dual cube d, whose vertex box starts at cell centre d + 0.5: world = d + 0.5 + (p - 2)
-    verts[vo + i] = packed_float3(float3(c0 + d) + (snRelaxed(W, v0) - 1.5f));
-    scratch[vo + i] = octEncode(snNormal(W, glut));
+    uint cfg = snCfg(W, 2, 2, 2);
+    bool loose = snLoose(d, cfg, brk, bytes);
+    float3 p = loose ? float3(2.0f) + unpack_unorm4x8_to_float(v0[cfg]).xyz : snRelaxed(W, v0);
+    verts[vo + i] = packed_float3(float3(c0 + d) + (p - 1.5f));
+    scratch[vo + i] = octEncode(loose ? snNormal4(W, glut4) : snNormal(W, glut));
   }
   threadgroup_barrier(mem_flags::mem_device);
 
   // 6. triangles. Quad of the crossing along axis a at cell c: cubes c - eb - ec, c - ec, c, c - eb ((a, b, c)
   //    cyclic) wind counter-clockwise seen from +a, which is outward when the lower cell is the solid one.
-  device const uchar* bytes = (device const uchar*)bricks;
   for (uint q = t; q < nq; q += SN_T) {
     uint tri = to + 2u * q, desc = indices[3u * tri];
     int3 c = int3(desc & 31u, (desc >> 5) & 31u, (desc >> 10) & 31u);
