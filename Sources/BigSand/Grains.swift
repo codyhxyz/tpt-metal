@@ -9,6 +9,7 @@ struct GrainPlan {
 struct GrainFrame {
   var org01 = SIMD4<Float>(), org2 = SIMD4<Float>()
   var tileM: Float = 0, texelM: Float = 0, levels: UInt32 = 0, period: UInt32 = 0
+  var siteM: Float = 0, pad0: Float = 0, pad1: Float = 0, pad2: Float = 0
 }
 enum G { static let texA = 3, texB = 4, texH0 = 5, texH1 = 6, bindFrame = 12 }
 
@@ -79,7 +80,7 @@ final class Grains {
   /// Per frame: the textures and the camera's place in each projection plane's hex lattice (Shaders/Grain.h).
   func bind(_ e: MTLComputeCommandEncoder, camPos: SIMD3<Float>, upscale: Float) {
     var f = GrainFrame()
-    f.tileM = plan.tileM; f.texelM = plan.texelM; f.levels = plan.levels; f.period = period
+    f.tileM = plan.tileM; f.texelM = plan.texelM; f.levels = plan.levels; f.period = period; f.siteM = plan.siteM
     // lattice coordinates: twice the tile coordinate (a lattice edge is half a tile), skewed to the triangle grid
     let l = 2.0 * World.cellMetres / Double(plan.tileM), per = Double(period), r3 = 3.0.squareRoot()
     let p = SIMD3<Double>(Double(camPos.x), Double(camPos.y), Double(camPos.z))
