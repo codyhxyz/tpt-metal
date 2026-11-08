@@ -3,8 +3,8 @@ import simd
 
 struct Cam {
   var pos = SIMD4<Float>(), fwd = SIMD4<Float>(), right = SIMD4<Float>(), up = SIMD4<Float>(), sun = SIMD4<Float>()
-  var tanHalf: Float = 0, aspect: Float = 1, shadows: UInt32 = 1, stats: UInt32 = 0
-  var jitter = SIMD2<Float>(), pad = SIMD2<Float>()
+  var tanHalf: Float = 0, aspect: Float = 1
+  var jitter = SIMD2<Float>()
 }
 
 /// A camera that flies: position plus yaw/pitch.
@@ -16,11 +16,11 @@ struct FlyCam {
   var speed: Float = 600
   init() {}
   var forward: SIMD3<Float> { SIMD3(sin(yaw) * cos(pitch), sin(pitch), cos(yaw) * cos(pitch)) }
-  func uniforms(aspect: Float, shadows: Bool, stats: Bool = false) -> Cam {
+  func uniforms(aspect: Float) -> Cam {
     let f = forward, r = simd_normalize(simd_cross(f, SIMD3<Float>(0, 1, 0))), u = simd_cross(r, f)
     let sun = simd_normalize(SIMD3<Float>(-0.55, 0.70, -0.35))
     return Cam(pos: SIMD4(pos, 0), fwd: SIMD4(f, 0), right: SIMD4(r, 0), up: SIMD4(u, 0), sun: SIMD4(sun, 0),
-               tanHalf: tan(fovY / 2), aspect: aspect, shadows: shadows ? 1 : 0, stats: stats ? 1 : 0)
+               tanHalf: tan(fovY / 2), aspect: aspect)
   }
 }
 

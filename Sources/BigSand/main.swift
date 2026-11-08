@@ -73,7 +73,7 @@ final class Renderer: NSObject, MTKViewDelegate {
   let e: World; var cam = FlyCam(); var tex: MTLTexture?
   var depth: MTLTexture?, motion: MTLTexture?, scaler: MTLFXTemporalScaler?, output: MTLTexture?
   var prev = Cam(), valid = false, frame = 0
-  var running = true, shadows = true
+  var running = true
   var last = CACurrentMediaTime(), lastTitle = CACurrentMediaTime()
   var simMs: [Double] = [], drawMs: [Double] = [], cpuMs: [Double] = [], frameMs: [Double] = []
   let lock = NSLock()
@@ -123,7 +123,6 @@ final class Renderer: NSObject, MTKViewDelegate {
     if reloadPending { reloadPending = false; e.reset(); valid = false }
     for k in v.keys where e.key(k, shift: v.shift) { v.keys.remove(k) }   // the world's keys
     if v.keys.remove(49) != nil { running.toggle() }          // Space
-    if v.keys.remove(3) != nil { shadows.toggle() }           // F
 
     let W = max(Int(view.drawableSize.width), 2), H = max(Int(view.drawableSize.height), 2)
     if scaler == nil || output!.width != W || output!.height != H { build(W, H) }
@@ -138,7 +137,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         cs.commit()
       }
     }
-    var u = cam.uniforms(aspect: Float(w) / Float(h), shadows: shadows)
+    var u = cam.uniforms(aspect: Float(w) / Float(h))
     // a new sub-pixel sample point every frame: the Halton (2, 3) sequence, 16 points
     func halton(_ i: Int, _ b: Int) -> Float { var f: Float = 1, r: Float = 0, n = i; while n > 0 { f /= Float(b); r += f * Float(n % b); n /= b }; return r }
     frame += 1

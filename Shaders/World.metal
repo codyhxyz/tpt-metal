@@ -37,7 +37,6 @@ constant int NH [[function_constant(1)]];   // cells tall (multiple of 64)
 #define C_TCAP 6             // tables mapped (written by the CPU)
 #define C_BCAP 7             // bricks mapped (written by the CPU)
 #define C_ARGS 8             // 8..10: indirect dispatch arguments
-#define C_STEPS 11           // render: DDA steps, when counting
 #define C_PICK 12            // 12..15: the cell under the crosshair and its face (0 = nothing)
 // physics (one step: see "Physics" below)
 #define C_L0 20              // bricks in awake list 0
@@ -506,14 +505,14 @@ kernel void w_editBricks(device uint* grid [[buffer(0)]], device uint* tables [[
 
 struct WCam {
   float4 pos, fwd, right, up, sun;
-  float tanHalf, aspect; uint shadows, stats;
-  float2 jitter, pad;
+  float tanHalf, aspect;
+  float2 jitter;
 };
 
-struct Hit { float t; int3 cell; int axis; uint mat; float wet; float tWater; int3 wcell; int waxis; uint steps; };
+struct Hit { float t; int3 cell; int axis; uint mat; float wet; float tWater; int3 wcell; int waxis; };
 
 inline Hit trace(float3 o, float3 d, float tMax, device const uint* grid, device const uint* tables, device const uchar* bricks) {
-  Hit h; h.t = -1; h.mat = AIR; h.wet = 0; h.tWater = -1; h.steps = 0; h.axis = -1; h.waxis = -1;
+  Hit h; h.t = -1; h.mat = AIR; h.wet = 0; h.tWater = -1; h.axis = -1; h.waxis = -1;
   float3 inv = 1.0f / d, dims = float3(NW, NH, NW);
   float3 ta = (0.0f - o) * inv, tb = (dims - o) * inv, tn = min(ta, tb), tf = max(ta, tb);
   float t = max(max(tn.x, tn.y), max(tn.z, 0.0f)), tExit = min(min(tf.x, tf.y), min(tf.z, tMax));
@@ -523,7 +522,6 @@ inline Hit trace(float3 o, float3 d, float tMax, device const uint* grid, device
   int3 c = clamp(int3(floor(o + d * t)), int3(0), int3(NW, NH, NW) - 1);
   if (axis >= 0) c[axis] = d[axis] > 0 ? 0 : int(dims[axis]) - 1;
   for (uint i = 0; i < 4096u; i++) {
-    h.steps++;
     uint ce = grid[chunkIdx(c >> 6)], m; int s;
     if (ce & W_UNI) { m = ce & 255u; s = 64; }
     else {
@@ -572,7 +570,6 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
   float2 ps = o.xz + d.xz * tSea;
   bool seaOut = tSea < 1e29f && (ps.x < 0 || ps.y < 0 || ps.x > float(NW) || ps.y > float(NW));
   Hit h = trace(o, d, seaOut ? tSea : 1e30f, grid, tables, bricks);
-  uint steps = h.steps;
   float3 col; float tt;
   bool center = g.x == W / 2 && g.y == H / 2;
   if (h.t >= 0) {
@@ -617,7 +614,6 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
     float depth = abs(dy) < 1e-3f * Hs ? tt * exp(-y0 / Hs) : tt * Hs / dy * (exp(-y0 / Hs) - exp(-(y0 + dy) / Hs));
     col = mix(col, skyColor(float3(d.x, 0.02f, d.z), L), 1.0f - exp(-k * max(depth, 0.0f)));
   }
-  if (C.stats != 0u) atomic_fetch_add_explicit(&ctr[C_STEPS], int(steps), memory_order_relaxed);
   if (center) {
     // what the crosshair is on: the first thing that isn't air (water counts), and the face the ray came through
     bool wetFirst = h.tWater >= 0 && !(seaOut && h.t < 0 && h.tWater == tSea) && (h.t < 0 || h.tWater < h.t);
