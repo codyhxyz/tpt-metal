@@ -111,8 +111,6 @@ final class World {
   var stepRate = 30.0
   /// Smooth surfaces near the camera (Sources/BigSand/Surfaces.swift).
   private(set) var surfaces: Surfaces!
-  /// Grain detail on powders' surfaces (Sources/BigSand/Grains.swift).
-  private(set) var grains: Grains!
   let pPresent: MTLRenderPipelineState
   /// Generation report: (stage, GPU ms).
   private(set) var genStages: [(String, Double)] = []
@@ -181,7 +179,6 @@ final class World {
     generate()
     surfaces = try Surfaces(world: self, lib: lib, fc: fc)
     residency.commit()
-    grains = try Grains(world: self, lib: lib, fc: fc)
   }
 
   // MARK: counters and memory
@@ -470,7 +467,6 @@ final class World {
     e.setBytes(&cam, length: MemoryLayout<Cam>.stride, index: 3); e.setBytes(&prev, length: MemoryLayout<Cam>.stride, index: 4)
     e.setBuffer(ctr, offset: 0, index: 5)
     surfaces.bind(e)
-    grains.bind(e, camPos: SIMD3(cam.pos.x, cam.pos.y, cam.pos.z), upscale: cam.pad.x)
     e.dispatchThreads(MTLSize(width: tex.width, height: tex.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
     e.endEncoding()
   }

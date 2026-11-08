@@ -25,7 +25,6 @@ constant int NH [[function_constant(1)]];   // cells tall (multiple of 64)
 #define W_CAVE_T 3300        // cave radius in noise units (of 32767): tunnels about 10 cells across
 #define W_TOPMAX 5           // deepest surface layer (beach sand)
 #define W_NEAR 1.0f
-#define W_CELL_M 0.3f         // metres per cell
 #define W_AMBIENT float3(0.32f, 0.37f, 0.45f)   // light from the sky
 
 // counters (one int buffer)
@@ -535,7 +534,6 @@ kernel void w_editBricks(device uint* grid [[buffer(0)]], device uint* tables [[
 #include "SurfaceJobs.h"
 #include "Mesh.h"
 #include "Liquid.h"
-#include "Grain.h"
 #include "Render.h"
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -801,6 +799,7 @@ kernel void w_wake(device const uint* wake [[buffer(0)]], device atomic_int* ctr
 // An edge with no push and less than a unit of flow is at rest; a brick with nothing flowing sleeps.
 
 #define W_MANNING 0.03f       // Manning roughness of a natural bed, s m^-1/3
+#define W_CELL_M 0.3f         // metres per cell
 #define W_U int(LIQ_L)        // units in a cell
 #define W_S int(LIQ_SHIFT)
 #define W_FULL (8 * W_U)      // units in a column
