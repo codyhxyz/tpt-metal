@@ -1,127 +1,19 @@
 import AppKit
 import MetalKit
-import ImageIO
-import UniformTypeIdentifiers
 import MetalFX
 
-// BigSand: a general voxel world (an island, every cell one byte of material) you fly over, dig and build in; or,
-// with --cube, a cube of sand that falls and piles up.
+// BigSand: a general voxel world (an island, every cell one byte of material) you fly over, dig and build in.
 //   swift run -c release BigSand                 window: click to grab the mouse (Esc lets go), WASD/QE fly,
-//                                                 Shift fast, scroll for fly speed, F shadows
-//       island: left mouse digs, right mouse places, 1-8 or Tab / Shift-Tab pick the material, [ ] the tool's radius
-//       cube:   R drop again, Space pause
-//   swift run -c release BigSand --cube S --shots [N]   headless cube benchmark
+//                                                 Shift fast, scroll for fly speed, Space pause
+//       left mouse digs, right mouse places, 1-8 or Tab / Shift-Tab pick the material, [ ] the tool's radius
 //   --world S: an island world S cells across (multiple of 64; default 16384), 1024 tall
-//   --cube S:  the falling cube instead, S cells on a side (multiple of 64; 1024 is 1.07 G grains, 4096 is 68.7 G)
 
-
-// MARK: - headless benchmark
-
-func savePNG(_ tex: MTLTexture, _ device: MTLDevice, _ queue: MTLCommandQueue, _ path: String) {
-  let w = tex.width, h = tex.height
-  let buf = device.makeBuffer(length: w * h * 8, options: .storageModeShared)!
-  let cb = queue.makeCommandBuffer()!, b = cb.makeBlitCommandEncoder()!
-  b.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(), sourceSize: MTLSize(width: w, height: h, depth: 1),
-         to: buf, destinationOffset: 0, destinationBytesPerRow: w * 8, destinationBytesPerImage: w * h * 8)
-  b.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-  let src = buf.contents().bindMemory(to: Float16.self, capacity: w * h * 4)
-  var px = [UInt8](repeating: 255, count: w * h * 4)
-  for i in 0..<(w * h) { for c in 0..<3 {
-    let v = max(0, min(1, Float(src[i * 4 + c])))
-    px[i * 4 + c] = UInt8(255 * (v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1 / 2.4) - 0.055))
-  } }
-  let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
-  let dst = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil)!
-  CGImageDestinationAddImage(dst, ctx.makeImage()!, nil); CGImageDestinationFinalize(dst)
-}
 
 func median(_ a: [Double]) -> Double { a.isEmpty ? 0 : a.sorted()[a.count / 2] }
 
-/// Headless run: `ticks` ticks, a few saved frames, GPU time per pass, and a check that no grain was created or lost.
-/// Each pass runs in its own command buffer so the GPU's start and end times of that buffer time it.
-func shots(ticks: Int, outDir: String, cube: Int) throws {
-  let e = try Engine(cube: cube)
-  print(String(format: "cube %d (%.2f G grains) in a %d x %d x %d world, %.2f GB of world state, %d flow steps per tick",
-               cube, Double(e.grains) / 1e9, e.WX, e.HY, e.WZ, Double(e.bytes) / 1e9, e.substeps))
-  let before = e.census()
-  let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1512, height: 982, mipmapped: false)
-  td.usage = [.shaderWrite, .shaderRead]; td.storageMode = .private
-  let tex = e.device.makeTexture(descriptor: td)!
-  td.pixelFormat = .r32Float
-  let depth = e.device.makeTexture(descriptor: td)!
-  td.pixelFormat = .rg16Float
-  let motion = e.device.makeTexture(descriptor: td)!
-  var cam = FlyCam(world: e).uniforms(aspect: 1512.0 / 982.0, shadows: true)
-  let at: Set<Int> = [60, 90, 110, 140, 200, 300, ticks - 1]
-  let passes = ["plan", "fall", "flow", "surface", "sun", "bounds"]
-  var ms: [String: [Double]] = [:], draw: [Double] = [], tickMs: [Double] = []
-  print("tick    plan   fall   flow  surf.    sun bounds    | whole tick  (GPU ms)  tiles awake")
-  for i in 0..<ticks {
-    // Even ticks: each pass in its own command buffer, to time the passes. Odd ticks: the whole tick in one command
-    // buffer, as the window runs it, to time the tick (separate buffers add gaps and let the GPU's clock drop between them).
-    var cbs: [(String, MTLCommandBuffer)] = []
-    if i % 2 == 0 {
-      e.encodeTick { name in
-        if let c = cbs.last, c.0 == name { return c.1 }
-        let c = e.queue.makeCommandBuffer()!; cbs.append((name, c)); return c
-      }
-    } else {
-      let c = e.queue.makeCommandBuffer()!; e.encodeTick(c); cbs.append(("tick", c))
-    }
-    for (_, c) in cbs { c.commit() }
-    for (_, c) in cbs { c.waitUntilCompleted() }
-    var row: [Double] = []
-    for (name, c) in cbs { let t = (c.gpuEndTime - c.gpuStartTime) * 1e3; ms[name, default: []].append(t); row.append(t) }
-    let total = cbs.map { $0.1.gpuEndTime }.max()! - cbs.map { $0.1.gpuStartTime }.min()!
-    if i % 2 == 1 { tickMs.append(total * 1e3) }
-    if at.contains(i) {
-      let cr = e.queue.makeCommandBuffer()!
-      var same = cam; e.encodeRender(cr, to: tex, depth: depth, motion: motion, cam: &cam, prev: &same)
-      cr.commit(); cr.waitUntilCompleted()
-      draw.append((cr.gpuEndTime - cr.gpuStartTime) * 1e3)
-      savePNG(tex, e.device, e.queue, "\(outDir)/tick-\(i).png")
-    }
-    if i % 2 == 0 && (at.contains(i) || i % 50 == 0) {
-      print(String(format: "%4d ", i) + row.map { String(format: " %6.2f", $0) }.joined() + String(format: "    |            %8d", e.activeTiles))
-    } else if i % 2 == 1 && (at.contains(i) || i % 50 == 1) {
-      print(String(format: "%4d  (one command buffer)                         | %6.2f      %8d", i, total * 1e3, e.activeTiles))
-    }
-  }
-  for p in passes { let a = ms[p] ?? []; print(String(format: "%-8@ median %6.2f ms, max %6.2f ms", p as NSString, median(a), a.max() ?? 0)) }
-  print(String(format: "tick     median %6.2f ms, max %6.2f ms (whole ticks, one command buffer each)", median(tickMs), tickMs.max() ?? 0))
-  print(String(format: "draw     median %6.2f ms at 1512x982", median(draw)))
-  let after = e.census()
-  print("grains: \(before) before, \(after) after -> \(before == after ? "conserved" : "CHANGED BY \(after - before)")")
-}
-
 // MARK: - window
 
-/// What the window shows: the island world or the falling cube.
-protocol Scene: AnyObject {
-  var device: MTLDevice { get }
-  func makeCommandBuffer() -> MTLCommandBuffer
-  func startCam() -> FlyCam
-  /// Once per rendered frame, before the rays: physics, or the tool. False if it encoded nothing (the buffer is then dropped).
-  func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool
-  func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, motion: MTLTexture, cam: inout Cam, prev: inout Cam)
-  func encodePresent(_ cb: MTLCommandBuffer, from tex: MTLTexture, pass: MTLRenderPassDescriptor)
-  func key(_ code: UInt16, shift: Bool) -> Bool   // true if it handled the key
-  /// What the window title adds after the timings: a few words.
-  func title() -> String
-  /// Back to the start: the cube hangs in the sky again; the island is generated afresh.
-  func reset()
-}
-
-extension Engine: Scene {
-  func makeCommandBuffer() -> MTLCommandBuffer { queue.makeCommandBuffer()! }
-  func startCam() -> FlyCam { FlyCam(world: self) }
-  func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { encodeTick(cb); return true }
-  func key(_ code: UInt16, shift: Bool) -> Bool { if code == 15 { reset(); return true }; return false }   // R: drop it again
-  func title() -> String { String(format: "%.2f G grains", Double(grains) / 1e9) }
-}
-
-extension World: Scene {
+extension World {
   func startCam() -> FlyCam { FlyCam(island: self) }
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { frame(cb, dig: dig, place: place) }
   func key(_ code: UInt16, shift: Bool) -> Bool {
@@ -178,7 +70,7 @@ final class View: MTKView {
 /// window's resolution (MetalFX's largest supported upscale, if smaller), and MetalFX's temporal scaler turning them
 /// into an antialiased frame at full resolution. Every displayed frame is a real one, at up to 120 Hz.
 final class Renderer: NSObject, MTKViewDelegate {
-  let e: Scene; var cam = FlyCam(); var tex: MTLTexture?
+  let e: World; var cam = FlyCam(); var tex: MTLTexture?
   var depth: MTLTexture?, motion: MTLTexture?, scaler: MTLFXTemporalScaler?, output: MTLTexture?
   var prev = Cam(), valid = false, frame = 0
   var running = true, shadows = true
@@ -187,7 +79,7 @@ final class Renderer: NSObject, MTKViewDelegate {
   let lock = NSLock()
   weak var window: NSWindow?
   var reloadPending = false
-  init(_ e: Scene) { self.e = e; cam = e.startCam() }
+  init(_ e: World) { self.e = e; cam = e.startCam() }
 
   /// Cmd-R: start the scene over at the next frame.
   @objc func reload(_ sender: Any?) { reloadPending = true }
@@ -229,7 +121,7 @@ final class Renderer: NSObject, MTKViewDelegate {
       case 14: cam.pos.y += speed; case 12: cam.pos.y -= speed
       default: break } }
     if reloadPending { reloadPending = false; e.reset(); valid = false }
-    for k in v.keys where e.key(k, shift: v.shift) { v.keys.remove(k); if k == 15 { valid = false } }   // the scene's keys (R: start MetalFX's history over too)
+    for k in v.keys where e.key(k, shift: v.shift) { v.keys.remove(k) }   // the world's keys
     if v.keys.remove(49) != nil { running.toggle() }          // Space
     if v.keys.remove(3) != nil { shadows.toggle() }           // F
 
@@ -286,20 +178,11 @@ final class Renderer: NSObject, MTKViewDelegate {
 
 let args = CommandLine.arguments
 func intArg(_ name: String) -> Int? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } }
-let cubeMode = args.contains("--cube")
-let cubeArg = intArg("--cube") ?? 1024
 let worldArg = intArg("--world") ?? 16384
-if let i = args.firstIndex(of: "--shots") {
-  let n = i + 1 < args.count ? Int(args[i + 1]) ?? 400 : 400
-  let out = FileManager.default.currentDirectoryPath + "/shots"
-  try? FileManager.default.createDirectory(atPath: out, withIntermediateDirectories: true)
-  try shots(ticks: n, outDir: out, cube: cubeArg)
-  exit(0)
-}
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
-let engine: Scene = cubeMode ? try Engine(cube: cubeArg) : try World(size: worldArg)
+let engine = try World(size: worldArg)
 let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1512, height: 982), styleMask: [.titled, .closable, .resizable, .miniaturizable],
                    backing: .buffered, defer: false)
 let view = View(frame: win.contentView!.bounds, device: engine.device)
