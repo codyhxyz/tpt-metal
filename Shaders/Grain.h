@@ -44,6 +44,10 @@ constant float G_SUN_DIAM = 0.53f * M_PI_F / 180.0f;   // rad
 constant uint G_SEED = 0x6772u;                        // the tile's hash stream
 
 // What the bake works out (g_plan), and what Grains.swift allocates from.
+constant float G_SQRT3 = 1.7320508f, G_INV_SQRT3 = 0.57735027f;   // the triangle lattice
+
+inline float gU(uint h) { return float(h >> 8) * (1.0f / 16777216.0f); }   // [0, 1), 24 bits
+
 struct GrainPlan {
   uint texels, sites, window, levels;   // tile side in texels; grain sites across; sites searched each way; mip levels
   float tileM, texelM, siteM, d50;      // tile side, texel, site spacing, median grain size (m)
@@ -85,13 +89,75 @@ inline GrainOut grainNone(float3 n) {
   return o;
 }
 
+inline bool grainy(uint mat) { return mat == SAND; }
+
+// Where the tile goes. Each axis-aligned plane is covered by a triangle lattice whose edge is half a tile (Heitz &
+// Neyret 2018's hex tiling). Each lattice vertex places the tile with its own offset and quarter turn (a symmetry of
+// the texel grid, so the turned tile is exact). A vertex's placement shows over the six triangles around it, two
+// edges across: half a tile per edge, so no placement shows the tile twice. Both choices below are one random pick
+// per pixel and frame, weighted so that MetalFX's accumulation gives the full blend:
+//   plane    axis k with probability n_k^2 (the weights sum to 1 since |n| = 1)
+//   vertex   one of the pixel's triangle's three, with probability its barycentric weight
+// A single pick keeps the tile's own statistics (a blend of two placements would halve their contrast).
 inline GrainOut grainDetail(GrainIn gi, GrainRes R) {
-  return grainNone(gi.n);
+  if (!grainy(gi.mat)) return grainNone(gi.n);
+  constant GrainFrame& F = *R.f;
+  float3 n = gi.n, n2 = n * n;
+  float u0 = float(gi.rnd & 0xffffu) * (1.0f / 65536.0f), u1 = float(gi.rnd >> 16) * (1.0f / 65536.0f);
+  int k = u0 < n2.x ? 0 : (u0 < n2.x + n2.y ? 1 : 2);
+  float3 eu = k == 0 ? float3(0, 0, 1) : float3(1, 0, 0);
+  float3 ev = k == 1 ? float3(0, 0, 1) : float3(0, 1, 0);
+  float2 org = k == 0 ? F.org01.xy : (k == 1 ? F.org01.zw : F.org2.xy);
+
+  // lattice coordinates (twice the tile's), skewed to the triangle grid, from the camera's (Grains.swift)
+  float2 q = float2(dot(gi.rel, eu), dot(gi.rel, ev)) * (2.0f * W_CELL_M / F.tileM);
+  float2 sk = org + float2(q.x - q.y * G_INV_SQRT3, q.y * (2.0f * G_INV_SQRT3));
+  float2 base = floor(sk), f = sk - base;
+  float wz = 1.0f - f.x - f.y;
+  int2 b = int2(base), v;
+  if (wz > 0.0f) v = u1 < wz ? b : (u1 < wz + f.y ? b + int2(0, 1) : b + int2(1, 0));
+  else v = u1 < -wz ? b + int2(1, 1) : (u1 < -wz + 1.0f - f.y ? b + int2(1, 0) : b + int2(0, 1));
+  uint2 vm = uint2(v) & (F.period - 1u);                  // the lattice repeats every `period` (two's complement)
+  float2 off = float2(gU(hash3(int(vm.x), int(vm.y), k, G_SEED + 1u)), gU(hash3(int(vm.x), int(vm.y), k, G_SEED + 2u)));
+  uint rq = hash3(int(vm.x), int(vm.y), k, G_SEED + 3u) & 3u;
+
+  // tile coordinates: the lattice point unskewed and halved, turned by the vertex's quarter turns, offset
+  float2 uv = 0.5f * float2(sk.x + 0.5f * sk.y, sk.y * (0.5f * G_SQRT3));
+  float2 tu = rq == 0u ? uv : (rq == 1u ? float2(-uv.y, uv.x) : (rq == 2u ? -uv : float2(uv.y, -uv.x)));
+  float2 tc = fract(tu + off);
+
+  // mip level: the pixel's footprint at the output's resolution, as the area-preserving circle on the projection
+  // plane (the plane shrinks the surface by |n_k|, a grazing view stretches it by 1 / |n.v|), in texels
+  float fp = gi.t * gi.pixK / F.org2.z * W_CELL_M;
+  float lod = clamp(log2(fp * sqrt(abs(n[k]) / max(abs(dot(n, gi.v)), 1e-6f)) / F.texelM), 0.0f, float(F.levels - 1u));
+  constexpr sampler sm(filter::linear, mip_filter::linear, address::repeat);
+  float4 A = R.a.sample(sm, tc, level(lod)), B = R.b.sample(sm, tc, level(lod));
+  float4 H0 = R.h0.sample(sm, tc, level(lod)), H1 = R.h1.sample(sm, tc, level(lod));
+
+  // slopes back from the tile's turn into the plane (tc = Rot * uv, so grad_uv = Rot^T grad_tc), then a bump of the
+  // surface (Mikkelsen 2020's surface gradient): n' = n - (grad - n (n . grad))
+  float2 gt = A.xy;
+  float2 gu = rq == 0u ? gt : (rq == 1u ? float2(gt.y, -gt.x) : (rq == 2u ? -gt : float2(-gt.y, gt.x)));
+  float3 gw = gu.x * eu + gu.y * ev;
+  GrainOut o;
+  o.n = normalize(n - (gw - n * dot(n, gw)));
+  o.rough = sqrt(max(A.z - gt.x * gt.x + A.w - gt.y * gt.y, 0.0f));   // the slopes' variance (turns don't change it)
+  o.albedo = MATS[gi.mat].var * B.z;
+  o.occl = B.y;
+  // the sun over the grains: its elevation above the surface against the horizon toward its azimuth (in the tile's
+  // turned frame: + a quarter turn = + 2 of the 8 directions)
+  float eL = asin(clamp(dot(gi.L, n), -1.0f, 1.0f));
+  float az = atan2(dot(gi.L, ev), dot(gi.L, eu)) * (float(G_DIRS) / (2.0f * M_PI_F)) + 2.0f * float(rq);
+  float hor[G_DIRS] = {H0.x, H0.y, H0.z, H0.w, H1.x, H1.y, H1.z, H1.w};
+  float j = floor(az), fj = az - j;
+  int j0 = (int(j) % G_DIRS + G_DIRS) % G_DIRS, j1 = (j0 + 1) % G_DIRS;
+  float al = mix(hor[j0], hor[j1], fj) * (0.5f * M_PI_F);
+  o.sun = saturate((eL - al) / G_SUN_DIAM + 0.5f);
+  o.dt = 0.0f; o.on = true;
+  return o;
 }
 
 // --- bake (Grains.swift runs it once at launch: g_plan, then g_height, then g_derive, then mipmaps)
-
-inline float gU(uint h) { return float(h >> 8) * (1.0f / 16777216.0f); }   // [0, 1), 24 bits
 
 kernel void g_plan(device GrainPlan& P [[buffer(0)]], uint t [[thread_position_in_grid]]) {
   if (t != 0u) return;
