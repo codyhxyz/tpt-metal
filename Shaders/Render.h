@@ -146,8 +146,7 @@ inline void walkWater(thread Seen& s, Walk h, float3 o, float3 d) {
 // Material colour varied per cell (the variation fades where a cell is smaller than a pixel), lit by the sky and the
 // sun. Voxel faces: Minecraft's per-side shade on the sky's light (top 1, north/south 0.8, east/west 0.6, bottom 0.5).
 // Smooth surfaces: the same falloff from top to bottom, continuous in the normal, so rounded shapes read as round.
-// A grainy material (Grain.h) takes its normal, colour variation, sky occlusion, sun shadow, highlight and glitter from
-// its grains.
+// A grainy material (Grain.h) takes its normal, colour variation, sky occlusion and sun shadow from its grains.
 inline float3 shade(uint mat, int3 cell, bool smooth, float footprint, float3 L, float3 sunCol, GrainOut gr) {
   float3 n = gr.n;
   float r = float(hash3(cell.x, cell.y, cell.z, 3u) & 1023u) / 1023.0f;
@@ -155,7 +154,7 @@ inline float3 shade(uint mat, int3 cell, bool smooth, float footprint, float3 L,
   float3 base = matColor(mat) * (1.0f + dev);
   float side = smooth ? 0.7f + n.y * (0.25f + 0.05f * n.y)
                       : (n.y > 0.5f ? 1.0f : (n.y < -0.5f ? 0.5f : (abs(n.x) > 0.5f ? 0.6f : 0.8f)));
-  return base * (W_AMBIENT * side * gr.occl + sunCol * max(dot(n, L), 0.0f) * gr.sun) + sunCol * gr.spec;
+  return base * (W_AMBIENT * side * gr.occl + sunCol * max(dot(n, L), 0.0f) * gr.sun);
 }
 
 kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture2d<float, access::write> depthOut [[texture(1)]],

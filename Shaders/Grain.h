@@ -26,18 +26,7 @@
 //   horizons  8 directions, 45 degrees apart (two RGBA8 textures). Each is searched out until the tallest grain could
 //             no longer raise the horizon by one 8-bit step of its encoding ((pi/2) / 255).
 //   occlusion the unoccluded share of the cosine-weighted sky: mean over directions of cos^2(horizon elevation).
-//   sun       the sun's angular diameter, 0.53 degrees, sets the width of a grain's shadow edge, and widens the
-//             highlight: a disc of angular radius rho spreads the half-vector's slope by rho^2 / 8 (variance).
-//   highlight a dielectric's exact Fresnel at quartz's index, 1.544 (ordinary ray; sand is mostly quartz), on a
-//             Beckmann lobe (Gaussian slopes) whose variance is the grains' (LEAN) plus the sun's. Masking toward
-//             the eye is the tile's own horizon (the real grains), not a statistical shadowing term.
-//   glitter   (Zirr & Kaplanyan 2016) each grain shows one flat face. A pixel's footprint holds N grains (its area
-//             over a site's); a face sends the sun to the eye with probability p, the Beckmann density over the
-//             slopes that reflect some of the sun's disc. The count that do is drawn per footprint cell from a
-//             Poisson law with mean N p, stably (a hash of the cell in world space and its mip level), and scales
-//             the highlight by count / (N p): the mean is the smooth highlight, the spread is the sparkle. Under a
-//             grain per cell the tile's own grains are drawn, so there the highlight is left as it is.
-//             The Poisson draw: by inversion below a mean of 1; above it, a normal with the same mean and variance.
+//   sun       the sun's angular diameter, 0.53 degrees, sets the width of a grain's shadow edge.
 
 #define G_TEX_A 3            // texture2d<float> rgba16f: slopes bx, by (dh/du, dh/dv) and bx^2, by^2
 #define G_TEX_B 4            // texture2d<float> rgba16f: bx*by, ambient occlusion, albedo deviation [-1, 1], height (m)
@@ -52,7 +41,6 @@ constant float G_ZINGG = 2.0f / 3.0f;                  // Zingg's class boundary
 constant float G_PACK2D = 0.82f;                       // 2D random close packing
 constant float G_STEP8 = 1.0f / 255.0f;                // one 8-bit step
 constant float G_SUN_DIAM = 0.53f * M_PI_F / 180.0f;   // rad
-constant float G_IOR = 1.544f;                         // quartz, ordinary ray
 constant uint G_SEED = 0x6772u;                        // the tile's hash stream
 
 // What the bake works out (g_plan), and what Grains.swift allocates from.
@@ -73,7 +61,6 @@ struct GrainFrame {
   float4 org01;                         // plane 0 (s, t), plane 1 (s, t)
   float4 org2;                          // plane 2 (s, t), output pixels per traced pixel, 0
   float tileM, texelM; uint levels, period;
-  float siteM, pad0, pad1, pad2;        // grain site spacing (m)
 };
 
 struct GrainRes { texture2d<float> a, b, h0, h1; constant GrainFrame* f; };
@@ -93,13 +80,12 @@ struct GrainOut {
   float rough;      // slope spread under the pixel (Beckmann roughness it adds)
   float occl;       // sky light reaching the surface, 0..1
   float sun;        // sunlight past the grains, 0..1
-  float spec;       // specular radiance per unit of the sun's colour (shade() adds sunCol * spec)
   float dt;         // change in hit distance, cells
   bool on;          // false: not a grainy material; shade() uses its own colour variation
 };
 
 inline GrainOut grainNone(float3 n) {
-  GrainOut o; o.n = n; o.albedo = 0.0f; o.rough = 0.0f; o.occl = 1.0f; o.sun = 1.0f; o.spec = 0.0f; o.dt = 0.0f; o.on = false;
+  GrainOut o; o.n = n; o.albedo = 0.0f; o.rough = 0.0f; o.occl = 1.0f; o.sun = 1.0f; o.dt = 0.0f; o.on = false;
   return o;
 }
 
@@ -168,58 +154,6 @@ inline GrainOut grainDetail(GrainIn gi, GrainRes R) {
   float al = mix(hor[j0], hor[j1], fj) * (0.5f * M_PI_F);
   o.sun = saturate((eL - al) / G_SUN_DIAM + 0.5f);
   o.dt = 0.0f; o.on = true;
-
-  // highlight
-  o.spec = 0.0f;
-  float3 h = normalize(gi.L + gi.v);
-  float nl = dot(o.n, gi.L), nv = dot(o.n, gi.v), nh = dot(o.n, h), vh = dot(gi.v, h);
-  float eV = asin(clamp(dot(gi.v, n), -1.0f, 1.0f));
-  float azV = atan2(dot(gi.v, ev), dot(gi.v, eu)) * (float(G_DIRS) / (2.0f * M_PI_F)) + 2.0f * float(rq);
-  float jv = floor(azV), fv = azV - jv;
-  int v0 = (int(jv) % G_DIRS + G_DIRS) % G_DIRS, v1 = (v0 + 1) % G_DIRS;
-  bool seen = eV > mix(hor[v0], hor[v1], fv) * (0.5f * M_PI_F);
-  if (nl <= 0.0f || nv <= 0.0f || nh <= 0.0f || !seen || o.sun <= 0.0f) return o;
-  float rho = 0.5f * G_SUN_DIAM;
-  float m2 = o.rough * o.rough + rho * rho / 8.0f;
-  float nh2 = nh * nh, tan2 = (1.0f - nh2) / nh2;
-  float pdf = exp(-tan2 / m2) / (M_PI_F * m2);              // density of a face's slope at the half-vector's
-  // exact unpolarised Fresnel of a dielectric (Walter et al. 2007)
-  float gF = sqrt(G_IOR * G_IOR - 1.0f + vh * vh), fa = (gF - vh) / (gF + vh), fb = (vh * (gF + vh) - 1.0f) / (vh * (gF - vh) + 1.0f);
-  float Fr = 0.5f * fa * fa * (1.0f + fb * fb);
-  // radiance F D / (4 nl nv) * E nl, D = pdf / nh^4; shade()'s diffuse is base * sunCol * nl, so E = pi * sunCol
-  float spec = Fr * pdf / (nh2 * nh2) / (4.0f * nv) * M_PI_F * o.sun;
-
-  // glitter: the footprint's grains, counted per cell of the mip level's texel grid in the plane the normal faces most
-  // (world-anchored: the same cells every frame, whichever plane and vertex the shading picked), both levels around
-  // the footprint blended by their weights
-  int kd = n2.x >= n2.y && n2.x >= n2.z ? 0 : (n2.y >= n2.z ? 1 : 2);
-  float3 du = kd == 0 ? float3(0, 0, 1) : float3(1, 0, 0), dv = kd == 1 ? float3(0, 0, 1) : float3(0, 1, 0);
-  float2 od = kd == 0 ? F.org01.xy : (kd == 1 ? F.org01.zw : F.org2.xy);
-  float2 qd = float2(dot(gi.rel, du), dot(gi.rel, dv)) * (2.0f * W_CELL_M / F.tileM);
-  float2 sd = od + float2(qd.x - qd.y * G_INV_SQRT3, qd.y * (2.0f * G_INV_SQRT3));
-  float2 pm = 0.5f * float2(sd.x + 0.5f * sd.y, sd.y * (0.5f * G_SQRT3)) * F.tileM;   // metres in the plane
-  float p = pdf * M_PI_F * rho * rho / (4.0f * vh * nh2 * nh);   // the share of faces that send the sun to the eye
-  float L0 = floor(lod), wL = lod - L0, gl = 0.0f;
-  for (int i = 0; i < 2; i++) {
-    float lv = L0 + float(i), cellM = F.texelM * exp2(lv), N = (cellM / F.siteM) * (cellM / F.siteM);
-    float mult = 1.0f;
-    if (N >= 1.0f) {
-      float lam = N * p;
-      int2 cid = int2(floor(pm / cellM));
-      uint hc = hash3(cid.x, cid.y, int(lv) * 3 + kd, G_SEED + 4u);
-      float cnt;
-      if (lam < 1.0f) {
-        float u = gU(hc), pk = exp(-lam), ck = pk; cnt = 0.0f;
-        while (u > ck && pk > 0.0f) { cnt += 1.0f; pk *= lam / cnt; ck += pk; }
-      } else {
-        float u1 = (float(hash3(cid.x, cid.y, int(lv) * 3 + kd, G_SEED + 5u) >> 8) + 1.0f) * (1.0f / 16777216.0f);
-        cnt = max(0.0f, round(lam + sqrt(lam) * sqrt(-2.0f * log(u1)) * cos(2.0f * M_PI_F * gU(hc))));
-      }
-      mult = lam > 0.0f ? cnt / lam : 0.0f;
-    }
-    gl += (i == 0 ? 1.0f - wL : wL) * mult;
-  }
-  o.spec = spec * gl;
   return o;
 }
 
@@ -310,11 +244,7 @@ kernel void g_derive(texture2d<float, access::read> HU [[texture(0)]], texture2d
     hor[j] = al / (0.5f * M_PI_F);
     ao += cos(al) * cos(al);
   }
-  // the slope's spread inside the texel: it changes by the second difference across it; a slope changing linearly
-  // over the texel is uniform over that range, variance (range)^2 / 12
-  float dx = (gH(HU, c + int2(1, 0), n) - 2.0f * h0 + gH(HU, c - int2(1, 0), n)) / P.texelM;
-  float dy = (gH(HU, c + int2(0, 1), n) - 2.0f * h0 + gH(HU, c - int2(0, 1), n)) / P.texelM;
-  A.write(float4(bx, by, bx * bx + dx * dx / 12.0f, by * by + dy * dy / 12.0f), g);
+  A.write(float4(bx, by, bx * bx, by * by), g);
   B.write(float4(bx * by, ao / float(G_DIRS), hu.y, h0), g);
   H0.write(float4(hor[0], hor[1], hor[2], hor[3]), g);
   H1.write(float4(hor[4], hor[5], hor[6], hor[7]), g);
