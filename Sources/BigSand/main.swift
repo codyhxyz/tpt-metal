@@ -104,9 +104,6 @@ protocol Scene: AnyObject {
   func startCam() -> FlyCam
   /// Once per rendered frame, before the rays: physics, or the tool. False if it encoded nothing (the buffer is then dropped).
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool
-  /// Once per rendered frame, before the rays: the smooth surfaces (meshing, BLAS and TLAS builds), in a buffer of
-  /// their own so their GPU time shows apart from the rays'. `render` is the frame's render buffer. False if it encoded nothing.
-  func encodeSurfaces(_ cb: MTLCommandBuffer, render: MTLCommandBuffer, cam: Cam) -> Bool
   func encodeRender(_ cb: MTLCommandBuffer, to tex: MTLTexture, depth: MTLTexture, motion: MTLTexture, cam: inout Cam, prev: inout Cam)
   func encodePresent(_ cb: MTLCommandBuffer, from tex: MTLTexture, pass: MTLRenderPassDescriptor)
   func key(_ code: UInt16, shift: Bool) -> Bool   // true if it handled the key
@@ -120,7 +117,6 @@ extension Engine: Scene {
   func makeCommandBuffer() -> MTLCommandBuffer { queue.makeCommandBuffer()! }
   func startCam() -> FlyCam { FlyCam(world: self) }
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { encodeTick(cb); return true }
-  func encodeSurfaces(_ cb: MTLCommandBuffer, render: MTLCommandBuffer, cam: Cam) -> Bool { false }
   func key(_ code: UInt16, shift: Bool) -> Bool { if code == 15 { reset(); return true }; return false }   // R: drop it again
   func title() -> String { String(format: "%.2f G grains", Double(grains) / 1e9) }
 }
@@ -128,9 +124,6 @@ extension Engine: Scene {
 extension World: Scene {
   func startCam() -> FlyCam { FlyCam(island: self) }
   func encodeFrame(_ cb: MTLCommandBuffer, dig: Bool, place: Bool) -> Bool { frame(cb, dig: dig, place: place) }
-  func encodeSurfaces(_ cb: MTLCommandBuffer, render: MTLCommandBuffer, cam: Cam) -> Bool {
-    surfaces.update(cb, render: render, camera: SIMD3(cam.pos.x, cam.pos.y, cam.pos.z)); return true
-  }
   func key(_ code: UInt16, shift: Bool) -> Bool {
     // 1-8: sand, water, stone, rock, plant, snow, basalt, wall; Tab / Shift-Tab: the next / previous material
     let mats: [UInt16: UInt32] = [18: World.SAND, 19: World.WATER, 20: World.STONE, 21: World.ROCK, 23: World.PLANT,
@@ -183,7 +176,7 @@ final class Renderer: NSObject, MTKViewDelegate {
   var prev = Cam(), valid = false, frame = 0
   var running = true, shadows = true
   var last = CACurrentMediaTime(), lastTitle = CACurrentMediaTime()
-  var simMs: [Double] = [], meshMs: [Double] = [], drawMs: [Double] = [], cpuMs: [Double] = [], frameMs: [Double] = []
+  var simMs: [Double] = [], drawMs: [Double] = [], cpuMs: [Double] = [], frameMs: [Double] = []
   let lock = NSLock()
   weak var window: NSWindow?
   var reloadPending = false
@@ -252,14 +245,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     frame += 1
     u.jitter = SIMD2(halton(frame % 16 + 1, 2) - 0.5, halton(frame % 16 + 1, 3) - 0.5)
     if !valid { prev = u }
-    let cm = e.makeCommandBuffer(), cr = e.makeCommandBuffer()
-    if e.encodeSurfaces(cm, render: cr, cam: u) {
-      cm.addCompletedHandler { [weak self] c in
-        guard let self else { return }
-        self.lock.lock(); self.meshMs.append((c.gpuEndTime - c.gpuStartTime) * 1e3); self.lock.unlock()
-      }
-      cm.commit()
-    }
+    let cr = e.makeCommandBuffer()
     e.encodeRender(cr, to: tex!, depth: depth!, motion: motion!, cam: &u, prev: &prev)
     s.colorTexture = tex; s.depthTexture = depth; s.motionTexture = motion; s.outputTexture = output
     s.inputContentWidth = w; s.inputContentHeight = h
@@ -280,12 +266,12 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     if now - lastTitle > 0.5 {
       lastTitle = now
-      lock.lock(); let sm = median(simMs), mm = median(meshMs), d = median(drawMs)
-      simMs.removeAll(); meshMs.removeAll(); drawMs.removeAll(); lock.unlock()
+      lock.lock(); let sm = median(simMs), d = median(drawMs)
+      simMs.removeAll(); drawMs.removeAll(); lock.unlock()
       let cpu = median(cpuMs), fr = median(frameMs), worst = frameMs.max() ?? 0
       cpuMs.removeAll(); frameMs.removeAll()
-      // ms: GPU physics, surfaces, rays; CPU; frame interval (worst)
-      window?.title = String(format: "phys %.1f · surf %.1f · rays %.1f · cpu %.1f · frame %.1f (%.0f) ms · ", sm, mm, d, cpu, fr, worst)
+      // ms: GPU physics, rays; CPU; frame interval (worst)
+      window?.title = String(format: "phys %.1f · rays %.1f · cpu %.1f · frame %.1f (%.0f) ms · ", sm, d, cpu, fr, worst)
         + e.title() + (running ? "" : " · paused")
     }
   }

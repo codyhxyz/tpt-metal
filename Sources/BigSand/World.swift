@@ -109,8 +109,6 @@ final class World {
   /// Physics steps per second: the time scale of falling, since a step moves a grain at most one cell. Set by eye
   /// while playing (`,` halves it, `.` doubles it).
   var stepRate = 30.0
-  /// Smooth surfaces near the camera (Sources/BigSand/Surfaces.swift).
-  private(set) var surfaces: Surfaces!
   let pPresent: MTLRenderPipelineState
   /// Generation report: (stage, GPU ms).
   private(set) var genStages: [(String, Double)] = []
@@ -177,8 +175,6 @@ final class World {
     for b in [grid, owner, tableFree, brickFree, ctr, fresh, storage, chunkList, wake, cbits, wetFlag] + lists + bits { residency.addAllocation(b) }
     residency.commit()
     generate()
-    surfaces = try Surfaces(world: self, lib: lib, fc: fc)
-    residency.commit()
   }
 
   // MARK: counters and memory
@@ -219,7 +215,7 @@ final class World {
   // MARK: generation
 
   /// A fresh island: every edit undone. The pools keep their mapped memory and are filled again from the start.
-  func reset() { generate(); surfaces.reset() }   // generate() also clears the physics: counters, bitmaps, step
+  func reset() { generate() }   // generate() also clears the physics: counters, bitmaps, step
 
   private func generate() {
     let t0 = CACurrentMediaTime()
@@ -316,7 +312,6 @@ final class World {
     let e = cb.makeComputeCommandEncoder()!
     e.setBuffer(grid, offset: 0, index: 0); e.setBuffer(tables.buffer, offset: 0, index: 1)
     e.setBuffer(ctr, offset: 0, index: 3); e.setBytes(&E, length: MemoryLayout<WEdit>.stride, index: 5)
-    e.setBuffer(surfaces.solidDirty, offset: 0, index: 15); e.setBuffer(surfaces.liquidDirty, offset: 0, index: 16)   // w_editBricks' dirty marks
     func fix() { e.setComputePipelineState(pFixFree); e.setBuffer(ctr, offset: 0, index: 0); e.dispatchThreads(one, threadsPerThreadgroup: one)
                  e.setBuffer(grid, offset: 0, index: 0) }
     e.setComputePipelineState(pEditChunks)
@@ -353,8 +348,6 @@ final class World {
     let curCount = (cur == 0 ? C.list0 : C.list1).rawValue, nextCount = (nxt == 0 ? C.list0 : C.list1).rawValue
     let one = MTLSize(width: 1, height: 1, depth: 1), none = UInt32.max
     let e = cb.makeComputeCommandEncoder()!
-    // the surfaces' dirty bits, for w_move and w_waterApply (no other kernel here binds 15 or 16)
-    e.setBuffer(surfaces.solidDirty, offset: 0, index: 15); e.setBuffer(surfaces.liquidDirty, offset: 0, index: 16)
     func args(_ count: Int, per: Int, arg: C, cap: UInt32, zero: [Int] = []) {
       var z = SIMD4<UInt32>(repeating: none)
       for (i, v) in zero.enumerated() { z[i] = UInt32(v) }
@@ -466,7 +459,6 @@ final class World {
     e.setBuffer(grid, offset: 0, index: 0); e.setBuffer(tables.buffer, offset: 0, index: 1); e.setBuffer(bricks.buffer, offset: 0, index: 2)
     e.setBytes(&cam, length: MemoryLayout<Cam>.stride, index: 3); e.setBytes(&prev, length: MemoryLayout<Cam>.stride, index: 4)
     e.setBuffer(ctr, offset: 0, index: 5)
-    surfaces.bind(e)
     e.dispatchThreads(MTLSize(width: tex.width, height: tex.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
     e.endEncoding()
   }
