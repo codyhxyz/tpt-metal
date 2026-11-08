@@ -24,46 +24,13 @@ struct FlyCam {
   }
 }
 
-/// All the shaders, from one or more libraries.
-struct ShaderLib {
-  let libs: [MTLLibrary]
-  func makeFunction(name: String, constantValues: MTLFunctionConstantValues) throws -> MTLFunction {
-    for l in libs where l.functionNames.contains(name) { return try l.makeFunction(name: name, constantValues: constantValues) }
-    throw NSError(domain: "BigSand", code: 2, userInfo: [NSLocalizedDescriptionKey: "no shader function \(name)"])
+/// The shaders: .build/BigSand.metallib, which scripts/build-shaders.sh compiles (the launcher runs it whenever a
+/// file in Shaders/ changed). Found by walking up from the executable (.build/<triple>/release/BigSand).
+func loadShaderLibrary(_ dev: MTLDevice) throws -> MTLLibrary {
+  var dir = Bundle.main.executableURL!.deletingLastPathComponent()
+  while dir.lastPathComponent != ".build" {
+    if dir.path == "/" { fatalError("BigSand isn't running from the package's .build directory") }
+    dir = dir.deletingLastPathComponent()
   }
-}
-
-/// The shaders: the precompiled BigSand.metallib inside the .app, else the one scripts/build-shaders.sh leaves in
-/// .build/, else every Shaders/*.metal compiled from source now (so a plain `swift run` still works).
-func loadShaderLibrary(_ dev: MTLDevice) throws -> ShaderLib {
-  let fm = FileManager.default
-  // The package's .build directory, found by walking up from the executable (.build/<triple>/release/BigSand).
-  var buildDir: URL? = nil
-  if let exe = Bundle.main.executableURL {
-    var dir = exe.deletingLastPathComponent()
-    while dir.path != "/" {
-      if dir.lastPathComponent == ".build" { buildDir = dir; break }
-      dir = dir.deletingLastPathComponent()
-    }
-  }
-  let packageRoot = buildDir?.deletingLastPathComponent()
-
-  let libs = [Bundle.main.resourceURL?.appendingPathComponent("BigSand.metallib"),
-              buildDir?.appendingPathComponent("BigSand.metallib")].compactMap { $0 }
-  for url in libs where fm.fileExists(atPath: url.path) {
-    let lib = try dev.makeLibrary(URL: url)
-    print("shaders: precompiled \(url.path)")
-    return ShaderLib(libs: [lib])
-  }
-  let dirs = [Bundle.main.resourceURL, packageRoot?.appendingPathComponent("Shaders"),
-              URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("Shaders")].compactMap { $0 }
-  for dir in dirs {
-    let files = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasSuffix(".metal") }.sorted()
-    if files.isEmpty { continue }
-    let compiled = try files.map { try dev.makeLibrary(source: try String(contentsOf: dir.appendingPathComponent($0), encoding: .utf8), options: nil) }
-    print("shaders: compiled from source in \(dir.path) (run scripts/build-shaders.sh to skip this)")
-    return ShaderLib(libs: compiled)
-  }
-  throw NSError(domain: "BigSand", code: 1, userInfo: [NSLocalizedDescriptionKey:
-    "no BigSand.metallib or Shaders/*.metal found (looked in \((libs + dirs).map(\.path)))"])
+  return try dev.makeLibrary(URL: dir.appendingPathComponent("BigSand.metallib"))
 }

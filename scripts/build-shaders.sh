@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Compiles Shaders/*.metal ahead of time into one .build/BigSand.metallib, so the app skips the source compile
-# at launch. Needs the Metal Toolchain: xcodebuild -downloadComponent MetalToolchain
+# Compiles Shaders/*.metal into .build/BigSand.metallib, the only place the app loads its shaders from.
+# Needs the Metal Toolchain: xcodebuild -downloadComponent MetalToolchain
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

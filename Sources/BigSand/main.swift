@@ -3,8 +3,9 @@ import MetalKit
 import MetalFX
 
 // BigSand: a general voxel world (an island, every cell one byte of material) you fly over, dig and build in.
-//   swift run -c release BigSand                 window: click to grab the mouse (Esc lets go), WASD/QE fly,
-//                                                 Shift fast, scroll for fly speed, Space pause
+//   /Applications/BigSand.app (scripts/make-launcher.sh) rebuilds what changed and runs it.
+//   click to grab the mouse (Esc lets go), WASD/QE fly,
+//     Shift fast, scroll for fly speed, Space pause
 //       left mouse digs, right mouse places, 1-8 or Tab / Shift-Tab pick the material, [ ] the tool's radius
 //   --world S: an island world S cells across (multiple of 64; default 16384), 1024 tall
 
