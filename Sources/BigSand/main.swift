@@ -251,7 +251,6 @@ final class Renderer: NSObject, MTKViewDelegate {
     func halton(_ i: Int, _ b: Int) -> Float { var f: Float = 1, r: Float = 0, n = i; while n > 0 { f /= Float(b); r += f * Float(n % b); n /= b }; return r }
     frame += 1
     u.jitter = SIMD2(halton(frame % 16 + 1, 2) - 0.5, halton(frame % 16 + 1, 3) - 0.5)
-    u.pad.x = Float(W) / Float(w)   // output pixels per traced pixel: the render shapes cells that span 2 or more
     if !valid { prev = u }
     let cr = e.makeCommandBuffer()
     e.encodeRender(cr, to: tex!, depth: depth!, motion: motion!, cam: &u, prev: &prev)

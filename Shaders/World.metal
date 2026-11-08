@@ -545,193 +545,6 @@ inline Hit trace(float3 o, float3 d, float tMax, device const uint* grid, device
   return h;
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Shapes. Near the camera a surface isn't its cell's face: each group of materials is a smooth field, built at the
-// hit from the 5^3 cells around it (tpt3d's look; tpt3d blurs its whole grid into fields every frame, these exist
-// only where a ray lands, so they cost nothing anywhere else and are never out of date).
-//   groups   open (air), loose (powders), ground (natural statics), liquid, built (crisp cubes: walls, metal,
-//            planks, brick). A group's field is its occupancy blurred by the quadratic B-spline (3 cells per axis
-//            at any point), over its own cells and open space only: F = B(group) / B(group + open). Other groups
-//            are left out, so two groups' surfaces run into each other and cross in a crease (tpt3d's normalised
-//            channels). Solids count liquid as open; liquids count solids as neither. The surface is F = 1/2.
-//   thin     a lone cell, a one-cell stream or film blurs below 1/2. Where the field at the hit cell's centre is
-//            under the bulk peak, the level is lowered so the surface sits half a cell from the centre (tpt3d's
-//            THIN_RADIUS). Along an axis the B-spline falls from B(0) = 3/4 to B(1/2) = 1/2, a factor 2/3, so the
-//            bulk peak is (1/2) / (2/3) = 3/4.
-//   search   the ray's span inside the box where the window's field is exact (the hit cell padded by half a cell:
-//            the surface can bulge that far into open cells), sampled every 1/4 cell (half the thinnest feature's
-//            radius: a ray misses a bead only within its outer 3 %), then bisected to 1/256 of a cell.
-//   built    the cube's face, its edges rounded in the shading over tpt3d's bevel radius, 0.12 cells, where the
-//            cell across the edge is open.
-//   where    only where a cell spans at least 2 output pixels (the shape is a cell's worth of detail; Nyquist).
-//            Beyond, the face is drawn as before.
-constant uchar GRP[NMAT] = {   // 0 open, 1 loose, 2 ground, 3 liquid, 4 built
-  0, 2, 1, 2, 1, 1, 2, 4,                 // air, rock, sand, plant, snow, stone, basalt, wall
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,        // clay .. coal dust
-  2, 4, 4, 4, 2, 2, 2, 4, 4, 4,           // wood, planks, metal, brick, coal, sandstone, limestone, titanium, tungsten, gold
-  3, 3, 3, 3, 3, 3, 3, 3,                 // the liquids
-};
-static_assert(NMAT == 37, "GRP lists every material");
-#define SH_OPEN 0u
-#define SH_LOOSE 1u
-#define SH_GROUND 2u
-#define SH_LIQUID 3u
-#define SH_BUILT 4u
-constant float SH_BULK = 0.75f;          // see "thin"
-constant float SH_STEP = 0.25f;          // see "search"
-constant float SH_BEVEL = 0.12f;         // tpt3d's gfx.bevel
-constant float SH_PIX = 2.0f;            // see "where"
-constant float SH_REACH = 1.7320508f;    // a ray that slips past a rounded corner is shaped again up to one cell
-                                         // diagonal behind the first cell it hit; beyond, the face it reaches is drawn
-
-// The window: cells o .. o + 4 per axis, one 125-bit mask per group (bit x + 5 y + 25 z), groups 0..3 (built cells
-// are in none: no field counts them).
-struct Win { ulong m[8]; int3 o; };
-inline bool wBit(thread const Win& w, uint g, uint k) { return ((w.m[2u * g + (k >> 6)] >> (k & 63u)) & 1ul) != 0ul; }
-inline bool wAny(thread const Win& w, uint g) { return (w.m[2u * g] | w.m[2u * g + 1u]) != 0ul; }
-
-inline Win winLoad(int3 c, device const uint* grid, device const uint* tables, device const uchar* bricks) {
-  Win w; w.o = c - 2;
-  for (int i = 0; i < 8; i++) w.m[i] = 0ul;
-  int3 hi = int3(NW, NH, NW) - 1;
-  int3 lo = clamp(w.o, int3(0), hi), top = clamp(w.o + 4, int3(0), hi);
-  int3 b0 = lo >> 3;
-  uint E[8];                                          // the (at most 2 x 2 x 2) bricks' entries
-  for (int k = 0; k < 8; k++) {
-    int3 b = min(b0 + int3(k & 1, (k >> 1) & 1, k >> 2), top >> 3);
-    uint ce = grid[chunkIdx(b >> 3)];
-    E[k] = (ce & W_UNI) ? ce : tables[ulong(ce) * 512ul + loc(b & 7)];
-  }
-  for (int z = 0; z < 5; z++)
-    for (int y = 0; y < 5; y++)
-      for (int x = 0; x < 5; x++) {
-        int3 cc = clamp(w.o + int3(x, y, z), int3(0), hi);   // outside the world: the nearest edge cell
-        int3 rb = (cc >> 3) - b0;
-        uint e = E[rb.x + 2 * rb.y + 4 * rb.z];
-        uint m = (e & W_UNI) ? (e & 255u) : uint(bricks[ulong(e) * 512ul + loc(cc & 7)]);
-        uint g = GRP[min(m, uint(NMAT) - 1u)];
-        if (g < SH_BUILT) { uint k = uint(x + 5 * y + 25 * z); w.m[2u * g + (k >> 6)] |= 1ul << (k & 63u); }
-      }
-  return w;
-}
-
-// Quadratic B-spline weights of the cells at -1, 0, +1 from the nearest centre, at offset f in [-1/2, 1/2]; and
-// their derivatives.
-inline float3 b2w(float f) { float a = 0.5f - f, b = 0.5f + f; return float3(0.5f * a * a, 0.75f - f * f, 0.5f * b * b); }
-inline float3 b2d(float f) { return float3(f - 0.5f, -2.0f * f, f + 0.5f); }
-
-// Group g's field at window point p (exact for p in [1.5, 3.5]^3); outside: what counts as open for it.
-inline float shField(thread const Win& w, uint g, uint outside, float3 p) {
-  float3 s = p - 0.5f, r = round(s), f = s - r;
-  int3 i = int3(r) - 1;
-  float3 wx = b2w(f.x), wy = b2w(f.y), wz = b2w(f.z);
-  float sg = 0.0f, sd = 0.0f;
-  #pragma unroll
-  for (int c = 0; c < 3; c++)
-    #pragma unroll
-    for (int b = 0; b < 3; b++)
-      #pragma unroll
-      for (int a = 0; a < 3; a++) {
-        uint k = uint(i.x + a + 5 * (i.y + b) + 25 * (i.z + c));
-        float wt = wx[a] * wy[b] * wz[c];
-        bool in = wBit(w, g, k);
-        bool open = wBit(w, SH_OPEN, k) || ((outside & 1u) != 0u && wBit(w, SH_LIQUID, k));
-        sg += in ? wt : 0.0f; sd += (in || open) ? wt : 0.0f;
-      }
-  return sd > 0.0f ? sg / sd : 0.0f;
-}
-// The same with its gradient: (F, dF/dx, dF/dy, dF/dz).
-inline float4 shFieldG(thread const Win& w, uint g, uint outside, float3 p) {
-  float3 s = p - 0.5f, r = round(s), f = s - r;
-  int3 i = int3(r) - 1;
-  float3 wx = b2w(f.x), wy = b2w(f.y), wz = b2w(f.z), dx = b2d(f.x), dy = b2d(f.y), dz = b2d(f.z);
-  float4 G = 0.0f, D = 0.0f;
-  #pragma unroll
-  for (int c = 0; c < 3; c++)
-    #pragma unroll
-    for (int b = 0; b < 3; b++)
-      #pragma unroll
-      for (int a = 0; a < 3; a++) {
-        uint k = uint(i.x + a + 5 * (i.y + b) + 25 * (i.z + c));
-        float4 wt = float4(wx[a] * wy[b] * wz[c], dx[a] * wy[b] * wz[c], wx[a] * dy[b] * wz[c], wx[a] * wy[b] * dz[c]);
-        bool in = wBit(w, g, k);
-        bool open = wBit(w, SH_OPEN, k) || ((outside & 1u) != 0u && wBit(w, SH_LIQUID, k));
-        G += in ? wt : 0.0f; D += (in || open) ? wt : 0.0f;
-      }
-  if (D.x <= 0.0f) return float4(0.0f);
-  return float4(G.x / D.x, (G.yzw * D.x - G.x * D.yzw) / (D.x * D.x));
-}
-inline uint shOutside(uint g) { return g == SH_LIQUID ? 0u : 1u; }   // bit 0: liquid counts as open
-
-// The nearest crossing of group g's surface along the ray (window coordinates q + d t) in [ta, tb]; < 0: none.
-inline float shCross(thread const Win& w, uint g, float iso, float3 q, float3 d, float ta, float tb) {
-  uint out = shOutside(g);
-  float tp = ta, fp = shField(w, g, out, q + d * ta);
-  if (fp >= iso) return ta;
-  for (float t = ta + SH_STEP; tp < tb; t += SH_STEP) {
-    float tc = min(t, tb), fc = shField(w, g, out, q + d * tc);
-    if (fc >= iso) {
-      float lo = tp, hi = tc;
-      for (int i = 0; i < 6; i++) {               // 1/4 cell -> 1/256
-        float m = 0.5f * (lo + hi);
-        if (shField(w, g, out, q + d * m) >= iso) hi = m; else lo = m;
-      }
-      return hi;
-    }
-    tp = tc;
-  }
-  return -1.0f;
-}
-
-// The level for group g at the window's centre cell (cell 2, 2, 2): lowered for thin features.
-inline float shIso(thread const Win& w, uint g) {
-  if (!wBit(w, g, 62u)) return 0.5f;               // 62 = 2 + 5 * 2 + 25 * 2
-  float pc = shField(w, g, shOutside(g), float3(2.5f));
-  return pc < SH_BULK && pc > 0.0f ? 0.5f * pc / SH_BULK : 0.5f;
-}
-
-// What a shaped hit is.
-struct Shaped { float t; float3 n; int3 cell; uint mat; };
-
-// The surface near walk hit `c` (entered at tHit): the nearest crossing of any group's field in the cell's padded
-// box. 1: hit (s filled); 0: the cell is built and nothing smooth comes first (draw its face, bevelled); 2: nothing
-// here (the ray passes through a rounded-off corner): walk on from tOut.
-inline int shapeAt(float3 o, float3 d, int3 c, float tHit, thread Shaped& s, thread float& tOut, thread Win& w,
-                   device const uint* grid, device const uint* tables, device const uchar* bricks) {
-  w = winLoad(c, grid, tables, bricks);
-  float3 q = o - float3(w.o);                        // the ray in window coordinates
-  float3 inv = 1.0f / d, ta3 = (float3(1.5f) - q) * inv, tb3 = (float3(3.5f) - q) * inv;
-  float ta = max(max(max(min(ta3.x, tb3.x), min(ta3.y, tb3.y)), min(ta3.z, tb3.z)), 0.0f);
-  float tb = min(min(max(ta3.x, tb3.x), max(ta3.y, tb3.y)), max(ta3.z, tb3.z));
-  tOut = tb;
-  uint hg = GRP[min(cellAt(c, grid, tables, bricks), uint(NMAT) - 1u)];
-  float best = 1e30f; uint bg = 0u;
-  for (uint g = SH_LOOSE; g <= SH_LIQUID; g++) {
-    if (!wAny(w, g)) continue;
-    float t = shCross(w, g, shIso(w, g), q, d, ta, hg == SH_BUILT ? min(tb, tHit) : tb);
-    if (t >= 0.0f && t < best) { best = t; bg = g; }
-  }
-  if (bg == 0u) return hg == SH_BUILT ? 0 : 2;
-  float3 p = q + d * best;
-  float4 F = shFieldG(w, bg, shOutside(bg), p);
-  s.t = best;
-  s.n = length(F.yzw) > 0.0f ? -normalize(F.yzw) : -d;
-  // the material: the group's cell just inside the surface, else its nearest cell in the window
-  int3 k = int3(floor(p - s.n * 0.5f));
-  if (!(all(k >= 0) && all(k < 5) && wBit(w, bg, uint(k.x + 5 * k.y + 25 * k.z)))) {
-    float bd = 1e30f; int3 pk = int3(floor(p));
-    for (int z = -1; z <= 1; z++) for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
-      int3 e = clamp(pk + int3(x, y, z), int3(0), int3(4));
-      if (!wBit(w, bg, uint(e.x + 5 * e.y + 25 * e.z))) continue;
-      float dd = distance_squared(float3(e) + 0.5f, p);
-      if (dd < bd) { bd = dd; k = e; }
-    }
-  }
-  s.cell = w.o + k;
-  s.mat = min(cellAt(clamp(s.cell, int3(0), int3(NW, NH, NW) - 1), grid, tables, bricks), uint(NMAT) - 1u);
-  return 1;
-}
-
 inline float3 skyColor(float3 d, float3 L) {
   float3 sky = mix(float3(0.72, 0.80, 0.90), float3(0.26, 0.46, 0.82), pow(saturate(d.y), 0.6f));
   float sd = max(dot(d, L), 0.0f);
@@ -754,105 +567,45 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
   float tSea = d.y < 0 && o.y > float(W_SEA) ? (float(W_SEA) - o.y) / d.y : 1e30f;
   float2 ps = o.xz + d.xz * tSea;
   bool seaOut = tSea < 1e29f && (ps.x < 0 || ps.y < 0 || ps.x > float(NW) || ps.y > float(NW));
-  float tLim = seaOut ? tSea : 1e30f;
-  Hit h = trace(o, d, tLim, grid, tables, bricks);
+  Hit h = trace(o, d, seaOut ? tSea : 1e30f, grid, tables, bricks);
   uint steps = h.steps;
-  float lodK = 2.0f * C.tanHalf / float(H), up = max(C.pad.x, 1.0f);
-  float shapeT = up / (SH_PIX * lodK);              // nearer than this a cell spans SH_PIX output pixels or more
-  // The surface the ray stops at, shaped near the camera (Shapes, above).
-  float tS = h.t; uint mS = h.mat; int3 cS = h.cell; int axS = h.axis;
-  float3 n = float3(0);
-  if (axS >= 0) n[axS] = d[axS] > 0 ? -1.0f : 1.0f; else n = -d;
-  float3 nf = n;                                    // the face's normal (its per-side shade)
-  bool smooth = false;
-  {
-    float tFirst = h.t;
-    Hit cur = h;
-    while (cur.t >= 0 && cur.t <= shapeT) {
-      Shaped sh; float tOut; Win w;
-      int r = shapeAt(o, d, cur.cell, cur.t, sh, tOut, w, grid, tables, bricks);
-      if (r == 1) { tS = sh.t; n = sh.n; mS = sh.mat; cS = sh.cell; smooth = true; break; }
-      if (r == 0) {
-        // a built cube's face: round its edges where the cell across is open
-        float3 p = o + d * cur.t - float3(cur.cell);
-        for (int b = 0; b < 3; b++) {
-          if (b == cur.axis) continue;
-          int3 e = int3(0); e[b] = 1;
-          uint kl = uint(62 - (b == 0 ? 1 : (b == 1 ? 5 : 25))), kh = uint(62 + (b == 0 ? 1 : (b == 1 ? 5 : 25)));
-          bool openL = wBit(w, SH_OPEN, kl) || wBit(w, SH_LIQUID, kl), openH = wBit(w, SH_OPEN, kh) || wBit(w, SH_LIQUID, kh);
-          if (openL && p[b] < SH_BEVEL) n -= float3(e) * (1.0f - p[b] / SH_BEVEL);
-          if (openH && p[b] > 1.0f - SH_BEVEL) n += float3(e) * (1.0f - (1.0f - p[b]) / SH_BEVEL);
-        }
-        n = normalize(n);
-        break;
-      }
-      // the ray slips past a rounded-off corner: walk on from where the window's box ends
-      Hit nx = trace(o + d * tOut, d, tLim - tOut, grid, tables, bricks);
-      steps += nx.steps;
-      if (nx.t < 0) { tS = -1.0f; break; }
-      nx.t += tOut;
-      cur = nx; tS = cur.t; mS = cur.mat; cS = cur.cell; axS = cur.axis;
-      n = float3(0);
-      if (axS >= 0) n[axS] = d[axS] > 0 ? -1.0f : 1.0f; else n = -d;
-      nf = n;
-      if (cur.t - tFirst > SH_REACH) break;
-    }
-  }
   float3 col; float tt;
   bool center = g.x == W / 2 && g.y == H / 2;
-  bool seaW = false;                                // the water is the endless sea's, not the world's
-  if (tS >= 0) {
-    float footprint = tS * lodK;
-    float r = float(hash3(cS.x, cS.y, cS.z, 3u) & 1023u) / 1023.0f;
-    float3 base = matColor(mS) * (1.0f + MATS[mS].var * (2.0f * r - 1.0f) / max(1.0f, footprint));
-    // Minecraft's per-side shade (top 1, north/south 0.8, east/west 0.6, bottom 0.5) on the sky's light, plus the
-    // sun; a shaped surface takes the same falloff continuously in its normal (1 up, 0.5 down, 0.7 level)
-    float side = smooth ? 0.7f + n.y * (0.25f + 0.05f * n.y)
-                        : (nf.y > 0.5f ? 1.0f : (nf.y < -0.5f ? 0.5f : (abs(nf.x) > 0.5f ? 0.6f : 0.8f)));
+  if (h.t >= 0) {
+    float3 n = float3(0); int k = h.axis;
+    if (k >= 0) n[k] = d[k] > 0 ? -1.0f : 1.0f; else n = -d;
+    float footprint = h.t * 2.0f * C.tanHalf / float(H);
+    float r = float(hash3(h.cell.x, h.cell.y, h.cell.z, 3u) & 1023u) / 1023.0f;
+    float3 base = matColor(h.mat) * (1.0f + MATS[h.mat].var * (2.0f * r - 1.0f) / max(1.0f, footprint));
+    // Minecraft's per-side shade (top 1, north/south 0.8, east/west 0.6, bottom 0.5) on the sky's light, plus the sun
+    float side = n.y > 0.5f ? 1.0f : (n.y < -0.5f ? 0.5f : (abs(n.x) > 0.5f ? 0.6f : 0.8f));
     col = base * (W_AMBIENT * side + sunCol * max(dot(n, L), 0.0f));
-    tt = tS;
+    tt = h.t;
   } else {
     col = skyColor(d, L);
     tt = 1e30f;
     // the endless sea around the island
     if (seaOut && h.tWater < 0) {
       // over a sand floor 60 cells down, like the world's own sea far from the island
-      h.tWater = tSea; h.waxis = 1; h.wet = 60.0f / max(-d.y, 0.05f); tt = tSea; seaW = true;
+      h.tWater = tSea; h.waxis = 1; h.wet = 60.0f / max(-d.y, 0.05f); tt = tSea;
       col = matColor(SAND) * (W_AMBIENT + sunCol * max(L.y, 0.0f));
     }
   }
-  if (h.tWater >= 0 && tS >= 0 && h.tWater >= tS) h.tWater = -1.0f;   // the water was behind the shaped surface
   if (h.tWater >= 0) {
-    float3 wn = float3(0, 1, 0);
-    bool edge = h.wcell.x == 0 || h.wcell.z == 0 || h.wcell.x == NW - 1 || h.wcell.z == NW - 1;   // the sea at the world's rim
-    if (h.waxis >= 0 && h.waxis != 1 && !edge) { wn = float3(0); wn[h.waxis] = d[h.waxis] > 0 ? -1.0f : 1.0f; }
-    // near the camera the water's surface is the liquid group's field (Shapes, above)
-    if (!seaW && h.tWater <= shapeT && h.tWater > 0.0f) {
-      Win w = winLoad(h.wcell, grid, tables, bricks);
-      float3 q = o - float3(w.o);
-      float3 inv = 1.0f / d, ta3 = (float3(1.5f) - q) * inv, tb3 = (float3(3.5f) - q) * inv;
-      float ta = max(max(max(min(ta3.x, tb3.x), min(ta3.y, tb3.y)), min(ta3.z, tb3.z)), 0.0f);
-      float tb = min(min(max(ta3.x, tb3.x), max(ta3.y, tb3.y)), max(ta3.z, tb3.z));
-      if (tS >= 0) tb = min(tb, tS);
-      float tw = shCross(w, SH_LIQUID, shIso(w, SH_LIQUID), q, d, ta, tb);
-      if (tw >= 0.0f) {
-        float4 F = shFieldG(w, SH_LIQUID, shOutside(SH_LIQUID), q + d * tw);
-        if (length(F.yzw) > 0.0f) wn = -normalize(F.yzw);
-        h.wet = max(h.wet - (tw - h.tWater), 0.0f);
-        h.tWater = tw;
-      }
-    }
     // light through water: absorbed per cell travelled (red first), then the surface reflects the sky (Fresnel)
     float3 sigma = float3(0.11, 0.035, 0.018);
     float3 tr = exp(-sigma * h.wet);
     float3 deep = float3(0.02, 0.10, 0.16);
     col = col * tr + deep * (1.0f - tr);
+    float3 wn = float3(0, 1, 0);
+    bool edge = h.wcell.x == 0 || h.wcell.z == 0 || h.wcell.x == NW - 1 || h.wcell.z == NW - 1;   // the sea at the world's rim
+    if (h.waxis >= 0 && h.waxis != 1 && !edge) { wn = float3(0); wn[h.waxis] = d[h.waxis] > 0 ? -1.0f : 1.0f; }
     float cosv = saturate(-dot(d, wn));
     if (o.y >= float(W_SEA) || h.waxis != 1) {
       float F = 0.02f + 0.98f * pow(1.0f - cosv, 5.0f);
       col = mix(col, skyColor(reflect(d, wn), L), F);
     }
-    if (tS < 0) tt = h.tWater;
+    if (h.t < 0) tt = h.tWater;
   }
   if (tt < 1e29f) {
     // haze thins with height (scale height 400 cells above the sea): the optical depth along the ray, in closed form
