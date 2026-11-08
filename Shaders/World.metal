@@ -565,11 +565,7 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
   d = select(d, float3(1e-7f), abs(d) < 1e-7f);
   float3 o = C.pos.xyz, L = normalize(C.sun.xyz);
   float3 sunCol = float3(1.0, 0.94, 0.84) * 1.25f;
-  // The endless sea outside the world: a ray that reaches the sea's surface outside the world stops there.
-  float tSea = d.y < 0 && o.y > float(W_SEA) ? (float(W_SEA) - o.y) / d.y : 1e30f;
-  float2 ps = o.xz + d.xz * tSea;
-  bool seaOut = tSea < 1e29f && (ps.x < 0 || ps.y < 0 || ps.x > float(NW) || ps.y > float(NW));
-  Hit h = trace(o, d, seaOut ? tSea : 1e30f, grid, tables, bricks);
+  Hit h = trace(o, d, 1e30f, grid, tables, bricks);
   float3 col; float tt;
   bool center = g.x == W / 2 && g.y == H / 2;
   if (h.t >= 0) {
@@ -585,12 +581,6 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
   } else {
     col = skyColor(d, L);
     tt = 1e30f;
-    // the endless sea around the island
-    if (seaOut && h.tWater < 0) {
-      // over a sand floor 60 cells down, like the world's own sea far from the island
-      h.tWater = tSea; h.waxis = 1; h.wet = 60.0f / max(-d.y, 0.05f); tt = tSea;
-      col = matColor(SAND) * (W_AMBIENT + sunCol * max(L.y, 0.0f));
-    }
   }
   if (h.tWater >= 0) {
     // light through water: absorbed per cell travelled (red first), then the surface reflects the sky (Fresnel)
@@ -599,8 +589,7 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
     float3 deep = float3(0.02, 0.10, 0.16);
     col = col * tr + deep * (1.0f - tr);
     float3 wn = float3(0, 1, 0);
-    bool edge = h.wcell.x == 0 || h.wcell.z == 0 || h.wcell.x == NW - 1 || h.wcell.z == NW - 1;   // the sea at the world's rim
-    if (h.waxis >= 0 && h.waxis != 1 && !edge) { wn = float3(0); wn[h.waxis] = d[h.waxis] > 0 ? -1.0f : 1.0f; }
+    if (h.waxis >= 0 && h.waxis != 1) { wn = float3(0); wn[h.waxis] = d[h.waxis] > 0 ? -1.0f : 1.0f; }
     float cosv = saturate(-dot(d, wn));
     if (o.y >= float(W_SEA) || h.waxis != 1) {
       float F = 0.02f + 0.98f * pow(1.0f - cosv, 5.0f);
@@ -616,7 +605,7 @@ kernel void w_render(texture2d<float, access::write> out [[texture(0)]], texture
   }
   if (center) {
     // what the crosshair is on: the first thing that isn't air (water counts), and the face the ray came through
-    bool wetFirst = h.tWater >= 0 && !(seaOut && h.t < 0 && h.tWater == tSea) && (h.t < 0 || h.tWater < h.t);
+    bool wetFirst = h.tWater >= 0 && (h.t < 0 || h.tWater < h.t);
     bool got = wetFirst || h.t >= 0;
     int3 pc = wetFirst ? h.wcell : h.cell;
     int ax = wetFirst ? h.waxis : h.axis;
